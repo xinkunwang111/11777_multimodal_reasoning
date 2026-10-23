@@ -68,12 +68,11 @@ def test_vstar_pipeline(mock):
     common = ["--model", mock / "tiny", "--dtype", "float32", "--dataset", "vstar", "--data_root", mock / "vstar",
               "--max_pixels", 120000]
     out = mock / "out"
-    run("probe1_find.py", *common, "--calib_frac", 0.4, "--top_heads", 2, "--max_new_tokens", 8, "--n_vis", 2, "--out", out / "p1")
-    run("probe2_read.py", *common, "--window", 2, "--stride", 2, "--out", out / "p2")
-    run("probe3_design.py", *common, "--p1", out / "p1", "--max_new_tokens", 8, "--conditions", "baseline", "pos_hflip",
-        "--out", out / "p3")
+    run("probe1_attention.py", *common, "--calib_frac", 0.4, "--top_heads", 2, "--n_vis", 2, "--out", out / "p1")
+    run("probe2_knockout.py", *common, "--window", 2, "--stride", 2, "--out", out / "p2")
     run("method_steer.py", *common, "--p1", out / "p1", "--p2", out / "p2", "--calib_frac", 0.4, "--lambdas", 0.5,
-        "--max_new_tokens", 8, "--crop_pixels", 32768, "--out", out / "m")
+        "--crop_pixels", 32768, "--out", out / "m")
+    run("appendix/qwen3vl_design.py", *common, "--p1", out / "p1", "--conditions", "baseline", "pos_hflip", "--out", out / "c")
     rows = [json.loads(line) for line in open(out / "p1" / "per_sample.jsonl")]
     assert rows and all(r["category"] in ("direct_attributes", "relative_position") for r in rows)
     rel = [r for r in rows if r["category"] == "relative_position"]
@@ -82,5 +81,7 @@ def test_vstar_pipeline(mock):
     assert len(cfg["heads"]) == 2 and 0 < cfg["box_threshold"] < 1
     assert not set(cfg["calib_qids"]) & {r["qid"] for r in rows}  # calibration and test never overlap
     m = list(open(out / "m" / "summary.csv"))
-    assert m[0].startswith("mode,self,attn,gt") and len(m) == 7  # base, base_hi + 4 modes
+    assert m[0].startswith("mode,attn,gt") and len(m) == 5  # header + base, base_hi, steer, crop
+    p2 = json.load(open(out / "p2" / "summary.json"))
+    assert set(p2["groups"]["all"]["used"]) == {"window", "delta_target", "delta_control", "share_target_hurts_more"}
     run("collect_results.py", out)

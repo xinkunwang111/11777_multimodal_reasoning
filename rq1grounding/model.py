@@ -1,4 +1,4 @@
-"""Loading Qwen3-VL, building inputs and the token layout, answering and greedy generation.
+"""Loading Qwen3-VL, building inputs and the token layout, answering.
 
 Qwen3-VL image tokens: ViT patch = 16 px, 2x2 spatial merge -> one LLM token per 32x32 px cell,
 emitted in raster order. Images are pre-resized to a multiple of 32 under a pixel budget, so the
@@ -191,24 +191,3 @@ def answer_from_logits(logits: torch.Tensor, prep: Prepared) -> dict:
 def rope_positions(model, inputs) -> torch.Tensor:
     pos, _ = model.model.get_rope_index(inputs["input_ids"], inputs["image_grid_thw"], None, inputs.get("attention_mask"))
     return pos
-
-
-@torch.no_grad()
-def greedy_generate(model, processor, inputs, max_new_tokens: int = 64, position_ids: torch.Tensor | None = None) -> str:
-    """Greedy decoding with an explicit KV-cache loop, so edited MRoPE positions (and any active hooks)
-    apply to the prompt; generated text tokens continue at last prompt position + 1."""
-    pos = position_ids if position_ids is not None else rope_positions(model, inputs)
-    out = model(**inputs, position_ids=pos, use_cache=True, logits_to_keep=1)
-    past, nxt = out.past_key_values, out.logits[0, -1].argmax()
-    eos = model.generation_config.eos_token_id
-    eos = set(eos if isinstance(eos, (list, tuple)) else [eos]) | {processor.tokenizer.eos_token_id}
-    last = pos[0, 0, -1]
-    toks = []
-    for i in range(max_new_tokens):
-        if int(nxt) in eos:
-            break
-        toks.append(int(nxt))
-        p = (last + 1 + i).to(pos.dtype).view(1, 1, 1).expand(3, 1, 1)
-        out = model(input_ids=nxt.view(1, 1), past_key_values=past, position_ids=p, use_cache=True)
-        past, nxt = out.past_key_values, out.logits[0, -1].argmax()
-    return processor.tokenizer.decode(toks, skip_special_tokens=True)

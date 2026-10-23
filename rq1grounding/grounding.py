@@ -1,23 +1,21 @@
-"""Where does the model think the object is?
+"""Attention grounding: where does the model look when it reads a question about an object?
 
-explicit  what it *says*: ask Qwen3-VL to box the object (native skill; JSON {"bbox_2d": [x1, y1, x2, y2]}
-          in relative 0-1000 coordinates) on exactly the image used for answering.
-implicit  where it *looks*: attention of the object's name tokens in the question onto the image tokens,
-          per layer and head; "grounding heads" are the few heads that localize best on a calibration split.
+Query groups (attention rows recorded onto the image tokens, per layer and head):
+  object:<k>  all tokens of object k's name in the question ("... the color of the [glove]?")
+  last        the answer position (the token whose logits pick the option letter)
+"Grounding heads" are the few heads whose object-query attention localizes best on a calibration split.
 
 Map metrics (threshold-free, against the per-cell GT coverage of the object's own box):
-  pointing      the map's peak cell overlaps the GT box
+  pointing      the map's peak cell overlaps the GT box ("the attention found the object")
   auroc         ranking of cells, GT cells vs the rest (0.5 = chance)
   energy / lift share of the map on the GT box; lift = energy / GT area share (1 = chance)
   own_gt_other  more mass on its own object than on the other objects (compositional grounding)
-A map becomes a box by thresholding at t x its peak, keeping the connected component around the peak
-and taking its bounding cells; t is calibrated (mean IoU with GT on the calibration split).
+A map becomes a region (box) by thresholding at t x its peak, keeping the connected component around
+the peak and taking its bounding cells; t is calibrated (mean IoU with GT on the calibration split).
 """
 
 from __future__ import annotations
 
-import json
-import re
 from dataclasses import dataclass
 
 import numpy as np
@@ -25,45 +23,10 @@ import torch
 from scipy import ndimage
 from scipy.stats import rankdata
 
-from . import geometry as G
 from .attention import AttentionRecorder
 from .hooks import HiddenStateRecorder, sink_tokens
-from .model import build_inputs, greedy_generate
 
-GROUND_PROMPT = "Locate the {name} in the image, output its bbox coordinates using JSON format."
 THRESHOLDS = np.round(np.arange(0.1, 1.0, 0.1), 2)
-
-# ---------------------------------------------------------------------------- explicit
-
-
-def parse_boxes(text: str) -> list:
-    """Boxes from Qwen3-VL grounding output (JSON list/dict with bbox_2d, 0-1000) -> normalized xyxy."""
-    body = text.split("```json")[-1].split("```")[0] if "```" in text else text
-    boxes = []
-    try:
-        data = json.loads(body)
-        for item in data if isinstance(data, list) else [data]:
-            if isinstance(item, dict) and len(item.get("bbox_2d", [])) == 4:
-                boxes.append(item["bbox_2d"])
-    except (json.JSONDecodeError, TypeError, ValueError):
-        pass
-    if not boxes:  # truncated / non-JSON output: take every 4-number list
-        num = r"(-?\d+(?:\.\d+)?)"
-        boxes = [list(map(float, m)) for m in re.findall(r"\[\s*" + r"\s*,\s*".join([num] * 4) + r"\s*\]", text)]
-    out = [G.from_qwen(b) for b in boxes]
-    return [b for b in out if b is not None]
-
-
-def ground_explicit(model, processor, image, name: str, max_new_tokens: int = 128, position_fn=None) -> dict:
-    """image: the (resized) image the model answers on. position_fn(inputs, image_pos) -> MRoPE ids (optional)."""
-    inputs, spans = build_inputs(model, processor, [image], GROUND_PROMPT.format(name=name))
-    pos = position_fn(inputs, spans[0].pos) if position_fn else None
-    text = greedy_generate(model, processor, inputs, max_new_tokens, pos)
-    boxes = parse_boxes(text)
-    return {"box": boxes[0] if boxes else None, "n_boxes": len(boxes), "raw": text[:300]}
-
-
-# ---------------------------------------------------------------------------- implicit
 
 
 @dataclass
@@ -74,7 +37,7 @@ class AttnMaps:
 
 
 def query_groups(prep) -> dict:
-    g = {"last": [prep.answer_pos], "question": prep.question_pos}
+    g = {"last": [prep.answer_pos]}
     g.update({f"object:{k}": p for k, p in enumerate(prep.object_pos)})
     return {k: v for k, v in g.items() if v}
 
