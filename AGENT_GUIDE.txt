@@ -1,0 +1,206 @@
+RQ1 实验运行指南（交给执行 agent 使用）
+================================================================
+
+【任务】
+在一台带 NVIDIA GPU 的 Linux 机器上，从克隆仓库开始，完成以下工作：
+  1. 下载 Qwen3-VL-8B-Instruct 权重和 V* 数据；
+  2. 跑完全部实验；
+  3. 交付 outputs/Qwen3-VL-8B-Instruct/REPORT.md，以及第 9 步列出的关键数字。
+
+【执行规则】
+- 按步骤顺序执行。每一步末尾都有【检查】，检查不通过就按【失败处理】做，不要跳过。
+- 不要修改仓库里的任何代码。如果看起来必须改代码，先停下来，向用户报告错误信息。
+- 第 1 步之后，所有命令都在仓库根目录 11777_multimodal_reasoning/ 下执行。
+- 运行时间长的命令放后台执行（nohup 或 tmux），并定期查看日志。
+- 最后按第 9 步的格式回报结果。
+
+
+第 0 步：检查机器
+----------------------------------------------------------------
+  nvidia-smi
+  df -h .
+
+【检查】
+  - 至少有 1 张 GPU。
+  - 显存 >= 24 GB；如果小于 24 GB，第 3 步改用 4B 模型。
+  - 当前磁盘剩余空间 >= 50 GB（Python 环境约 10 GB，模型权重约 17 GB，另有数据和结果）。
+  - 记下 nvidia-smi 右上角显示的 "CUDA Version"，第 2 步安装 PyTorch 时要用。
+
+
+第 1 步：克隆仓库
+----------------------------------------------------------------
+  git clone -b rq1-grounding-probes https://github.com/xinkunwang111/11777_multimodal_reasoning.git
+  cd 11777_multimodal_reasoning
+
+【检查】
+  ls run_all.sh scripts/probe1_attention.py scripts/check_setup.py
+  三个文件都应该存在。
+
+【失败处理】
+  - 报 "Repository not found" 或要求输入密码：仓库是私有的。先执行 gh auth login，
+    或改用 SSH 地址：git@github.com:xinkunwang111/11777_multimodal_reasoning.git
+  - 克隆成功但找不到上面这些文件：说明拉到了旧分支，执行 git checkout rq1-grounding-probes。
+
+
+第 2 步：安装 Python 环境
+----------------------------------------------------------------
+  conda create -n rq1 python=3.11 -y
+  conda activate rq1
+  （如果机器上没有 conda，改用：python3.11 -m venv .venv && source .venv/bin/activate）
+
+  安装与第 0 步记下的 CUDA 版本匹配的 PyTorch。CUDA >= 12.1 时可以直接用：
+  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+  （其他 CUDA 版本，到 https://pytorch.org/get-started/locally/ 查对应的安装命令）
+
+  pip install -r requirements.txt
+
+【检查】
+  python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.device_count())"
+    -> 第二个值必须是 True，第三个值 >= 1
+  python -c "import transformers; print(transformers.__version__)"
+    -> 版本必须 >= 4.57
+
+【失败处理】
+  - torch.cuda.is_available() 输出 False：安装的 PyTorch 与驱动的 CUDA 版本不匹配。先 pip uninstall torch torchvision，
+    再用正确的 --index-url 重新安装。
+  - transformers 版本 < 4.57：pip install -U "transformers>=4.57"
+
+
+第 3 步：下载模型权重
+----------------------------------------------------------------
+  mkdir -p checkpoints
+  hf download Qwen/Qwen3-VL-8B-Instruct --local-dir checkpoints/Qwen3-VL-8B-Instruct
+  （如果提示找不到 hf 命令，把 "hf download" 换成 "huggingface-cli download"）
+
+【检查】
+  ls checkpoints/Qwen3-VL-8B-Instruct/config.json
+  du -sh checkpoints/Qwen3-VL-8B-Instruct      -> 约 17G
+
+【失败处理】
+  - 连接超时或下载很慢：执行 export HF_ENDPOINT=https://hf-mirror.com 后重试同一条命令。
+  - 仍然失败，改用 ModelScope：
+      pip install modelscope
+      modelscope download --model Qwen/Qwen3-VL-8B-Instruct --local_dir checkpoints/Qwen3-VL-8B-Instruct
+  - 第 0 步发现显存 < 24 GB：改为下载 Qwen/Qwen3-VL-4B-Instruct 到 checkpoints/Qwen3-VL-4B-Instruct，
+    并把本指南后面所有的 "Qwen3-VL-8B-Instruct" 都替换成 "Qwen3-VL-4B-Instruct"。
+
+
+第 4 步：准备数据
+----------------------------------------------------------------
+  hf download craigwu/vstar_bench --repo-type dataset --local-dir data/vstar
+  python scripts/make_synthetic.py --out data/synthetic --n_images 300
+
+【检查】
+  ls data/vstar/direct_attributes/*.json | wc -l      -> 115
+  ls data/vstar/relative_position/*.json | wc -l      -> 76
+  wc -l data/synthetic/samples.jsonl                  -> 约 850-900
+
+【失败处理】
+  - 下载失败：同第 3 步，先设置 HF_ENDPOINT 镜像再重试。
+
+
+第 5 步：离线测试（约 1 分钟）
+----------------------------------------------------------------
+  pytest -q tests
+
+【检查】
+  最后一行显示全部 passed，没有 failed。
+
+【失败处理】
+  - 有测试失败：说明环境有问题，不要继续。把 pytest 输出的最后 40 行报告给用户。
+
+
+第 6 步：真模型自检（约 1-3 分钟）
+----------------------------------------------------------------
+  python scripts/check_setup.py --model checkpoints/Qwen3-VL-8B-Instruct --data_root data/vstar
+
+【检查】
+  - 最后一行是 "OK - setup works"。
+  - 把整段输出保存下来，第 9 步要附上。
+
+【失败处理】
+  - CUDA out of memory：加上 --max_pixels 524288 重试。如果这样能通过，后面每条 run_all.sh 命令前都要加 MAX_PIXELS=524288。
+  - "KeyError: 'qwen3_vl'" 或模型类型无法识别：transformers 版本太旧，回到第 2 步升级。
+
+
+第 7 步：试跑（每个数据集 20 题）
+----------------------------------------------------------------
+  export MODEL=checkpoints/Qwen3-VL-8B-Instruct
+  QUICK=1 bash run_all.sh 2>&1 | tee quick_run.log
+
+【检查】
+  - quick_run.log 的最后一行是 "all done -> outputs/Qwen3-VL-8B-Instruct_quick"。
+  - 文件 outputs/Qwen3-VL-8B-Instruct_quick/REPORT.md 存在。
+  - 记下 quick_run.log 中每个 "[ ok ] <步骤> (N s)" 的耗时，用来估算全量时间：
+      V* 步骤耗时 x 10 ≈ 全量 V* 耗时
+      synthetic 步骤耗时 x 45 ≈ 全量合成集耗时
+
+【失败处理】
+  - 出现 "[FAIL] <步骤>"：查看 outputs/Qwen3-VL-8B-Instruct_quick/logs/<步骤>.log 的最后 50 行。
+      * 如果是 out of memory：用 MAX_PIXELS=524288 QUICK=1 bash run_all.sh 重跑。
+      * 如果是下载失败：先设置 HF_ENDPOINT 镜像再重跑。
+    重跑同一条命令即可，已完成的步骤会自动跳过。
+  - 无法判断原因：停止执行，向用户报告该日志的最后 50 行。
+
+
+第 8 步：全量运行（后台执行）
+----------------------------------------------------------------
+  根据第 7 步估算的总耗时选择命令：
+
+  A. 时间充足（默认，跑 V* 和完整合成集）：
+     nohup env MODEL=checkpoints/Qwen3-VL-8B-Instruct bash run_all.sh > full_run.log 2>&1 &
+
+  B. 时间紧张（合成集缩小到 100 张图）：
+     rm -rf data/synthetic
+     nohup env MODEL=checkpoints/Qwen3-VL-8B-Instruct SYNTH_N=100 bash run_all.sh > full_run.log 2>&1 &
+
+  C. 只跑 V*：
+     nohup env MODEL=checkpoints/Qwen3-VL-8B-Instruct DATASETS=vstar bash run_all.sh > full_run.log 2>&1 &
+
+  （如果第 6 或第 7 步需要过 MAX_PIXELS=524288，在 env 后面加上 MAX_PIXELS=524288）
+
+  监控：
+    tail -n 20 full_run.log      （每 10-30 分钟看一次；每一步会打印 [run ] / [ ok ] / [FAIL]）
+    nvidia-smi                   （确认 GPU 在工作）
+
+【检查】
+  full_run.log 的最后一行是 "all done -> outputs/Qwen3-VL-8B-Instruct"。
+
+【失败处理】
+  - 出现 [FAIL]：按第 7 步的方法查看日志并修复，然后用同一条 nohup 命令重跑。已完成的步骤会跳过，不会重复计算。
+  - 进程意外中断（机器重启、会话断开）：直接重跑同一条 nohup 命令即可续跑。
+
+  可选：主实验完成后，再跑附录实验：
+    nohup env MODEL=checkpoints/Qwen3-VL-8B-Instruct STEPS="appendix report" bash run_all.sh > appendix_run.log 2>&1 &
+
+
+第 9 步：交付与回报
+----------------------------------------------------------------
+  打包结果（不包含模型权重和数据）：
+    tar czf rq1_results.tar.gz outputs/Qwen3-VL-8B-Instruct full_run.log
+
+  然后按以下格式回报。所有数字从 outputs/Qwen3-VL-8B-Instruct/REPORT.md 的 "## vstar" 部分摘录：
+
+  1. 环境：GPU 型号、显存、使用的模型、MAX_PIXELS 是否改过、选的是第 8 步的 A / B / C 哪个方案。
+  2. 第 6 步自检的完整输出。
+  3. 探查 1：报告中这一行
+       "attention on the object when the answer is correct: X; when it is wrong: Y"
+     的 X 和 Y，以及 answer accuracy。
+  4. 探查 2：reading window；delta_target 和 delta_control 两个值；share_target_hurts_more。
+  5. 方法：summary 表中以下几项的准确率：
+       base、base_hi、steer（attn 列）、crop（attn 列）、steer（gt 列）
+     以及 by_found 表（注意力找到 / 没找到物体两组）。
+  6. 合成集部分（如果跑了）：同样报告第 3-5 项。
+  7. 如有失败过的步骤：写出步骤名、原因和处理方式。
+  8. rq1_results.tar.gz 的存放路径。
+
+
+附：目录说明
+----------------------------------------------------------------
+  checkpoints/          模型权重
+  data/vstar/           V* 数据（direct_attributes/、relative_position/、test_questions.jsonl）
+  data/synthetic/       合成绑定数据集
+  outputs/<模型名>/     结果：REPORT.md、logs/、vstar/、synthetic/
+                        每个数据集目录下有 p1_attention/、p2_knockout/、method/
+  run_all.sh            一键运行脚本，变量说明见文件开头的注释
+  docs/DESIGN.md        实验设计说明（执行时不需要阅读）
