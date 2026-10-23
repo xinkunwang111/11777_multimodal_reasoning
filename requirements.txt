@@ -1,0 +1,11 @@
+torch>=2.3
+torchvision
+transformers>=4.57.0
+accelerate
+huggingface_hub
+pillow
+numpy
+scikit-learn
+matplotlib
+tqdm
+pytest
