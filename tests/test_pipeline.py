@@ -68,6 +68,9 @@ def test_vstar_pipeline(mock):
     common = ["--model", mock / "tiny", "--dtype", "float32", "--dataset", "vstar", "--data_root", mock / "vstar",
               "--max_pixels", 120000]
     out = mock / "out"
+    r = run("check_setup.py", "--model", mock / "tiny", "--dtype", "float32", "--dataset", "vstar",
+            "--data_root", mock / "vstar", "--max_pixels", 120000)
+    assert "OK - setup works" in r.stdout
     run("probe1_attention.py", *common, "--calib_frac", 0.4, "--top_heads", 2, "--n_vis", 2, "--out", out / "p1")
     run("probe2_knockout.py", *common, "--window", 2, "--stride", 2, "--out", out / "p2")
     run("method_steer.py", *common, "--p1", out / "p1", "--p2", out / "p2", "--calib_frac", 0.4, "--lambdas", 0.5,

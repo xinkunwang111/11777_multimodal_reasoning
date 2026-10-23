@@ -3,3 +3,4 @@ __pycache__/
 outputs/
 data/
 .pytest_cache/
+checkpoints/
