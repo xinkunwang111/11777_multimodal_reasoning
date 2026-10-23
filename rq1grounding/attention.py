@@ -96,7 +96,10 @@ class AttentionRecorder(_TextAttentionPatch):
         self.groups = {g: list(map(int, p)) for g, p in groups.items() if len(p)}
         self.all_q = sorted({p for v in self.groups.values() for p in v})
         self.col = {p: i for i, p in enumerate(self.all_q)}
-        self.keys = torch.as_tensor(np.asarray(keys), dtype=torch.long)
+        if isinstance(keys, torch.Tensor):
+            self.keys = keys.detach().cpu().long()
+        else:
+            self.keys = torch.as_tensor(np.asarray(keys), dtype=torch.long)
         self._maps: dict[str, list] = {}
 
     def on_layer(self, layer_idx, q, k, v, scaling, out):
@@ -163,11 +166,13 @@ class AttentionScaler(_TextAttentionPatch):
             L = k.shape[2]
             qpos = torch.tensor(sorted(set(map(int, e.queries))), device=q.device)
             target = torch.zeros(L, dtype=torch.bool, device=q.device)
-            target[torch.as_tensor(np.asarray(e.keys), dtype=torch.long, device=q.device)] = True
+            target_keys = e.keys.detach().long().to(q.device) if isinstance(e.keys, torch.Tensor) else torch.as_tensor(np.asarray(e.keys), dtype=torch.long, device=q.device)
+            target[target_keys] = True
             pool = None
             if e.mode == "shift":
                 pool = torch.zeros(L, dtype=torch.bool, device=q.device)
-                pool[torch.as_tensor(np.asarray(e.pool), dtype=torch.long, device=q.device)] = True
+                pool_keys = e.pool.detach().long().to(q.device) if isinstance(e.pool, torch.Tensor) else torch.as_tensor(np.asarray(e.pool), dtype=torch.long, device=q.device)
+                pool[pool_keys] = True
                 pool &= ~target
             p = edit_probs(self._rows(q, k, qpos, scaling), target, e.mode, e.value, pool)
             vs = v[0].float().repeat_interleave(self.n_rep, dim=0)  # [H, L, d]

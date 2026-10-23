@@ -4,3 +4,6 @@ outputs/
 data/
 .pytest_cache/
 checkpoints/
+*.log
+*.out
+*.sbatch

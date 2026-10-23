@@ -46,7 +46,7 @@ def query_groups(prep) -> dict:
 def record_attention(model, prep, sink_k: float = 5.0, position_ids=None) -> AttnMaps:
     """One forward pass: attention of all query groups onto the main image + sink detection + answer logits."""
     with AttentionRecorder(model, query_groups(prep), prep.image_pos.cpu()) as rec, \
-            HiddenStateRecorder(model, prep.image_pos, norm_only=True) as nrec:
+            HiddenStateRecorder(model, prep.image_pos.cpu(), norm_only=True) as nrec:
         out = model(**prep.inputs, position_ids=position_ids, use_cache=False, logits_to_keep=1)
     return AttnMaps(rec.maps, sink_tokens(nrec.stacked, sink_k), out.logits)
 

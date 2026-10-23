@@ -24,7 +24,10 @@ class HiddenStateRecorder:
 
     def __init__(self, model, positions, dtype=torch.float32, norm_only=False):
         self.model = model
-        self.pos = torch.as_tensor(np.asarray(positions), dtype=torch.long)
+        if isinstance(positions, torch.Tensor):
+            self.pos = positions.detach().cpu().long()
+        else:
+            self.pos = torch.as_tensor(np.asarray(positions), dtype=torch.long)
         self.dtype = dtype
         self.norm_only = norm_only
         self.handles, self.states = [], []
@@ -81,7 +84,12 @@ class VisualFeatureEditor:
                  ablate_deepstack=True, record=False):
         self.model = model
         self.zero_ds = zero_deepstack
-        self.ablate = None if ablate_tokens is None else torch.as_tensor(np.asarray(ablate_tokens), dtype=torch.long)
+        if ablate_tokens is None:
+            self.ablate = None
+        elif isinstance(ablate_tokens, torch.Tensor):
+            self.ablate = ablate_tokens.detach().cpu().long()
+        else:
+            self.ablate = torch.as_tensor(np.asarray(ablate_tokens), dtype=torch.long)
         self.ablate_mode = ablate_mode
         self.ablate_ds = ablate_deepstack
         self.record = record
