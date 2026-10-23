@@ -15,7 +15,7 @@ What is evaluated (see rq1grounding/grounding_eval.py for the metric definitions
 Protocol
   --mode calibrate : per-head and per-layer scores -> grounding heads, best layers, thresholds
                      -> <out>/grounding_config.json
-  --mode eval      : fixed config (--config) on the test split -> bench_table.csv, plots, vis
+  --mode eval      : fixed config (--config) on every sample of --dataset -> bench_table.csv, plots, vis
   --mode both      : calibrate on --calib_* data (default: a --calib_frac split of --dataset),
                      then evaluate on the rest
 """
@@ -316,6 +316,8 @@ def main():
     if args.calib_dataset:
         calib = load_dataset(args.calib_dataset, args.calib_root, None, args.calib_limit)
         test = samples
+    elif args.mode == "eval":  # thresholds come from --config, so every sample is test data
+        calib, test = [], samples
     else:
         calib, test = split(samples, args.calib_frac)
     model, processor = load_model(args.model, dtype=args.dtype)
