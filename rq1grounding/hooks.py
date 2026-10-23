@@ -77,18 +77,21 @@ class AttentionRecorder:
 
 class HiddenStateRecorder:
     """states[l] = residual stream entering LLM layer l (after DeepStack injection of
-    layer l-1); states[n_layers] = final pre-norm state. Shape [n_layers+1, n_pos, D]."""
+    layer l-1); states[n_layers] = final pre-norm state. Shape [n_layers+1, n_pos, D],
+    or [n_layers+1, n_pos] with norm_only=True (L2 norms; visual attention sinks have massive norms)."""
 
-    def __init__(self, model, positions, dtype=torch.float32):
+    def __init__(self, model, positions, dtype=torch.float32, norm_only=False):
         self.model = model
         self.pos = torch.as_tensor(positions)
         self.dtype = dtype
+        self.norm_only = norm_only
         self.handles = []
         self.states: list[torch.Tensor] = []
 
     def _hook(self, module, args, kwargs):
         h = args[0] if args else kwargs["hidden_states"]
-        self.states.append(h[0, self.pos.to(h.device)].to(self.dtype).cpu())
+        h = h[0, self.pos.to(h.device)].float()
+        self.states.append((h.norm(dim=-1) if self.norm_only else h).to(self.dtype).cpu())
 
     def __enter__(self):
         lm = self.model.model.language_model
