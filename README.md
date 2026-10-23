@@ -9,6 +9,48 @@
 
 > Qwen3-VL 没有 7B，稠密版本是 2B/4B/**8B**/32B。默认用 `Qwen/Qwen3-VL-8B-Instruct`；`--model` 可换成任意 Qwen3-VL。
 
+## 0. 一键运行
+
+```bash
+pip install -r requirements.txt
+QUICK=1 bash run_all.sh        # 先试跑：每个数据集 20 题，几分钟内确认整条流程能跑通
+bash run_all.sh                # 全部实验 -> outputs/Qwen3-VL-8B-Instruct/REPORT.md
+```
+
+`run_all.sh` 按顺序执行以下步骤，最后由 `scripts/collect_results.py` 把所有结果汇总到 `REPORT.md`（表格 + 关键图）：
+1. 生成合成集，若 V\* 不存在则自动下载；
+2. 在 V\* 和合成集上各跑一遍探针 01–04；
+3. bench：用合成集校准、在 V\* 上测试；合成集本身按 30/70 划分；
+4. SGZ 放大方法；
+5. 可选的分辨率扫描。
+
+常用环境变量：
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `MODEL` | `Qwen/Qwen3-VL-8B-Instruct` | 也可以是本地路径 |
+| `OUT` | `outputs/<模型名>` | |
+| `STEPS` | `data probes bench zoom sweep report` | 只跑部分步骤，如 `STEPS="bench zoom report"` |
+| `MAX_PIXELS` / `CROP_PIXELS` | 1048576（1024 token） | 全图 / 裁剪的像素预算 |
+| `SWEEP_TOKENS` | 空 | 如 `"256 4096"`：在这些 token 预算下重跑 bench 和 zoom |
+| `LIMIT` | 全部 | 每个数据集的题数上限 |
+| `GRAD` | 1 | 是否计算梯度图（每题多一次反向） |
+| `QUICK` | 0 | 1 = 试跑模式 |
+| `FORCE` | 0 | 1 = 忽略 `.done`，全部重跑 |
+| `KEEP_GOING` | 1 | 0 = 遇到第一个失败就停 |
+| `VERBOSE` | 0 | 1 = 日志同时打印到终端 |
+
+运行行为：
+- 每个步骤的日志在 `$OUT/logs/<step>.log`。
+- 完成的步骤会写 `.done` 标记，中断后直接重跑同一条命令即可续跑。
+- 多卡时可以把步骤拆开并行：
+  ```bash
+  CUDA_VISIBLE_DEVICES=0 STEPS="data probes" bash run_all.sh &
+  CUDA_VISIBLE_DEVICES=1 STEPS="bench zoom" bash run_all.sh
+  ```
+  第二个任务需要合成集，所以先跑完 `data` 再启动。
+- 访问不了 huggingface.co 时：`export HF_ENDPOINT=https://hf-mirror.com`。
+
 ---
 
 ## 1. Qwen3-VL 中与 grounding 相关的结构
