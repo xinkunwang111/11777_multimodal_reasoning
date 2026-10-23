@@ -1,5 +1,5 @@
 """Model-free checks: geometry, V* GT loading (official format), attention-map metrics, attention-edit math,
-synthetic scenes.  pytest -q tests/test_core.py"""
+VEA's image steps, synthetic scenes.  pytest -q tests/test_core.py"""
 
 import json
 import os
@@ -12,6 +12,7 @@ from PIL import Image
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from rq1grounding import geometry as G  # noqa: E402
+from rq1grounding import vea  # noqa: E402
 from rq1grounding.attention import edit_probs  # noqa: E402
 from rq1grounding.data import load_jsonl, load_vstar, mirror_option_idx, option_keywords, split  # noqa: E402
 from rq1grounding.grounding import auroc_rows, map_metrics, map_to_box  # noqa: E402
@@ -126,6 +127,55 @@ def test_edit_probs():
     z = edit_probs(torch.tensor([[0.5, 0.0, 0.0, 0.5]]), torch.tensor([False, True, True, False]), "shift", 0.5,
                    torch.tensor([False, False, False, True]))
     assert z[0, 1] == pytest.approx(0.125) and z[0, 2] == pytest.approx(0.125)  # no prior mass -> uniform
+
+
+# ---------------------------------------------------------------------------- VEA
+
+def test_vea_denoise_and_smoothing_match_the_original():
+    rng = np.random.default_rng(0)
+    gh, gw, cell = 6, 8, 4
+    g = (0.5 + 0.5 * rng.random((gh, gw))).astype(np.float32)  # no ratio above 2: no spikes
+    g[2, 3] = 50.0  # an isolated spike
+    d = vea.denoise(g, 10.0)
+    nb = [g[2 + dy, 3 + dx] for dy in (-1, 0, 1) for dx in (-1, 0, 1) if dy or dx]
+    assert d[2, 3] == pytest.approx(np.mean(nb)) and (d != g).sum() == 1
+    c = g.copy()
+    c[1:3, 1:3] = 50.0  # a cluster is evidence, not a spike
+    np.testing.assert_array_equal(vea.denoise(c, 10.0), c)
+    b = g.copy()
+    b[0, 4] = 50.0  # border tokens see copies of themselves (edge padding) and are never spikes
+    assert vea.denoise(b, 10.0)[0, 4] == 50.0
+    from scipy import ndimage
+
+    # the original (vea/highlight.py): paint each token onto its pixels, gaussian_filter with sigma = 0.5 x the
+    # shorter side, min-max normalise
+    canvas = np.kron(d, np.ones((cell, cell), np.float32))
+    ref = ndimage.gaussian_filter(canvas, 0.5 * min(canvas.shape))
+    np.testing.assert_allclose(vea.evidence_map(g.ravel(), gh, gw, cell), (ref - ref.min()) / (ref.max() - ref.min()), atol=1e-5)
+    ref = ndimage.gaussian_filter(np.kron(g, np.ones((cell, cell))), 3.0)  # sigma > 1: in pixels
+    np.testing.assert_allclose(vea.evidence_map(g.ravel(), gh, gw, cell, sigma=3.0, apply_denoise=False),
+                               (ref - ref.min()) / (ref.max() - ref.min()), atol=1e-5)
+    raw = vea.evidence_map(g.ravel(), gh, gw, cell, apply_denoise=False, apply_smooth=False)
+    np.testing.assert_allclose(raw, np.kron((g - g.min()) / (g.max() - g.min()), np.ones((cell, cell))), atol=1e-6)
+    assert not vea.evidence_map(np.ones(gh * gw), gh, gw, cell).any()  # constant map -> all zeros
+
+
+def test_vea_highlight_layers_and_stats():
+    rng = np.random.default_rng(1)
+    img = Image.fromarray(rng.integers(0, 256, (16, 24, 3), dtype=np.uint8))
+    emap = np.zeros((16, 24), np.float32)
+    emap[:8, :8] = 1.0
+    arr, out = np.asarray(img).astype(int), np.asarray(vea.highlight(img, emap, 0.5)).astype(int)
+    assert np.array_equal(out[:8, :8], arr[:8, :8]) and np.array_equal(out[8:], arr[8:] // 2)
+    assert np.array_equal(np.asarray(vea.highlight(img, emap, 1.0)), np.asarray(img))
+    assert len(vea.select_layers(np.zeros(36))) == 4 and len(vea.select_layers(np.zeros(28))) == 3  # 10%, rounded up
+    assert vea.select_layers([0.5, 0.9, np.nan, 0.7, 0.8], 0.4) == [1, 4]
+    assert vea.layer_span(36, 0.5, 1.0) == list(range(18, 36)) and vea.layer_span(36, 0.0, 0.5) == list(range(18))
+    attn = np.array([[0.1, 0.1, 0.1, 0.1], [0.4, 0.0, 0.0, 0.0]])  # [layers, cells]
+    st = vea.layer_stats(attn, np.array([1, 0, 0, 0]), n_tokens=10)
+    np.testing.assert_allclose(st["rapt_evd"], [1.0, 4.0])
+    np.testing.assert_allclose(st["rapt_nonevd"], [1.0, 0.0])
+    np.testing.assert_allclose(st["auroc"], [0.5, 1.0])
 
 
 # ---------------------------------------------------------------------------- synthetic set

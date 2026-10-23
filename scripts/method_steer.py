@@ -24,7 +24,6 @@ Outputs: calibration.json, per_sample.jsonl, summary.json, summary.csv, summary_
          region_quality.csv, by_found.csv
 """
 
-import csv
 import json
 import os
 import sys
@@ -36,7 +35,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from rq1grounding import geometry as G  # noqa: E402
 from rq1grounding.attention import AttentionScaler  # noqa: E402
 from rq1grounding.cli import (add_split_args, common_parser, load_p1_config, load_samples, nanmean, reading_layers,  # noqa: E402
-                              setup, to_jsonable, write_jsonl)
+                              setup, to_jsonable, write_csv, write_jsonl)
 from rq1grounding.cues import MODES, crop_cue, draw_cue, steer_edit, text_cue  # noqa: E402
 from rq1grounding.grounding import aggregate, map_metrics, map_to_box, record_attention  # noqa: E402
 from rq1grounding.model import answer_from_logits, forward, prepare  # noqa: E402
@@ -109,14 +108,6 @@ def calibrate(model, processor, calib, args, cfg, n_layers) -> dict:
     return {"layers": cands[best[0]], "layer_set": best[0], "value": best[1], "mode": args.steer_mode,
             "candidates": cands, "grid": [{"layer_set": k[0], "value": k[1], "acc": a, "mean_logp": lp}
                                           for k, (a, lp) in scores.items()]}
-
-
-def write_csv(path, rows):
-    if rows:
-        with open(path, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=list(dict.fromkeys(k for r in rows for k in r)))
-            w.writeheader()
-            w.writerows(to_jsonable(rows))
 
 
 def main():

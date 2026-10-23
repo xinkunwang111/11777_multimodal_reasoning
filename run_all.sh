@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-click runner: the two probes and the method on V* and the synthetic binding set, then REPORT.md.
+# One-click runner: the two probes and the two methods on V* and the synthetic binding set, then REPORT.md.
 #
 #   bash run_all.sh                          # everything
 #   QUICK=1 bash run_all.sh                  # dry run: 20 questions per dataset, small synthetic set
@@ -13,15 +13,17 @@
 #   p2        probe 2 - is that attention used? (attention knockout: target vs control) -> reading layers
 #   method    amplify the attention on the attention-found region in the reading layers;
 #             compared with crop (ViCrop-style zoom) and with GT regions            (uses p1, p2)
+#   vea       VEA (Seeing but Not Believing, ICLR 2026), reproduced: dim the image outside where
+#             the attention looks and answer again; the paper's ablations and analyses (own profiling)
 #   appendix  logit lens, linear probes, DeepStack / MRoPE ablations (off by default; uses p1)
 #   report    $OUT/REPORT.md
-# Calibration (grounding heads, thresholds, steer layers / strength) always uses a held-out split:
+# Calibration (grounding heads, thresholds, steer layers / strength, VEA layers) always uses a held-out split:
 # CALIB_FRAC of each dataset by default, or the synthetic set for V* with CALIB_FROM_SYNTH=1.
 #
 # A finished step leaves <dir>/.done and is skipped next time (FORCE=1 re-runs), so a crashed or
 # interrupted run is resumed by running the same command again. Logs: $OUT/logs/<step>.log.
 # Several GPUs: run p1 first, then e.g.
-#   CUDA_VISIBLE_DEVICES=0 STEPS="p2 method" bash run_all.sh &  CUDA_VISIBLE_DEVICES=1 STEPS="appendix" bash run_all.sh
+#   CUDA_VISIBLE_DEVICES=0 STEPS="p2 method" bash run_all.sh &  CUDA_VISIBLE_DEVICES=1 STEPS="vea appendix" bash run_all.sh
 # If huggingface.co is unreachable: export HF_ENDPOINT=https://hf-mirror.com
 
 set -uo pipefail
@@ -40,7 +42,7 @@ CALIB_FRAC=${CALIB_FRAC:-0.3}
 CALIB_FROM_SYNTH=${CALIB_FROM_SYNTH:-0}
 P2_GROUPS=${P2_GROUPS:-"all"}
 LIMIT=${LIMIT:-}
-STEPS=${STEPS:-"data p1 p2 method report"}
+STEPS=${STEPS:-"data p1 p2 method vea report"}
 QUICK=${QUICK:-0}
 FORCE=${FORCE:-0}
 KEEP_GOING=${KEEP_GOING:-1}
@@ -119,6 +121,7 @@ for dsarg in $DATASETS; do  # vstar | synthetic | path/to/samples.jsonl
     run "${ds}_method" "$D/method" $PY scripts/method_steer.py "${A[@]}" "${SPL[@]}" --p1 "$D/p1_attention" \
       --p2 "$D/p2_knockout" --crop_pixels "$CROP_PIXELS" --out "$D/method"
   fi
+  want vea && run "${ds}_vea" "$D/vea" $PY scripts/method_vea.py "${A[@]}" "${SPL[@]}" --out "$D/vea"
   if want appendix; then
     run "${ds}_appendix_logit_lens" "$D/appendix_logit_lens" $PY scripts/appendix/logit_lens.py "${A[@]}" --out "$D/appendix_logit_lens"
     run "${ds}_appendix_linear_probe" "$D/appendix_linear_probe" $PY scripts/appendix/linear_probe.py "${A[@]}" --out "$D/appendix_linear_probe"

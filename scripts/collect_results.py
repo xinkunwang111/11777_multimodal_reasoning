@@ -1,7 +1,7 @@
 """Collect the outputs of run_all.sh into one Markdown report: <out>/REPORT.md.
 
     python scripts/collect_results.py outputs/Qwen3-VL-8B-Instruct
-Layout read: <out>/<dataset>/{p1_attention, p2_knockout, method, appendix_*}
+Layout read: <out>/<dataset>/{p1_attention, p2_knockout, method, vea, appendix_*}
 """
 
 import csv
@@ -11,7 +11,8 @@ import sys
 
 import numpy as np
 
-TEXT_COLS = {"mode", "condition", "source", "feature", "group", "attention_found_object", "category", "cell"}
+TEXT_COLS = {"mode", "condition", "source", "feature", "group", "attention_found_object", "category", "cell", "method",
+             "image", "prompt", "scores", "vea_scores_peak_on_object"}
 
 
 def _json(path):
@@ -100,7 +101,7 @@ def method(d, root):
         return ""
     cal = _json(os.path.join(d, "calibration.json")) or {}
     srcs = [c for c in rows[0] if c not in ("mode", "mean_tokens")]
-    md = ["### Method - amplify the attention on the attention-found region (accuracy; columns = region source)\n"]
+    md = ["### Method A - amplify the attention on the attention-found region (accuracy; columns = region source)\n"]
     if cal:
         md.append(f"- steer: layers `{cal.get('layer_set')}` {cal.get('layers')}, {cal.get('mode')} {cal.get('value')} "
                   f"(chosen on the calibration split)\n")
@@ -114,6 +115,37 @@ def method(d, root):
     bc = _csv(os.path.join(d, "summary_by_category.csv"))
     if bc:
         md.append("by category:\n\n" + table(bc, ["category", "mode"] + srcs))
+    return "\n".join(md) + "\n"
+
+
+def vea(d, root):
+    s = _json(os.path.join(d, "summary.json"))
+    if not s:
+        return ""
+    pr, sn, hp = s["profile"], s["seeing_not_believing"], s["hyperparameters"]
+    md = ["### Method B - VEA: dim the image outside where the attention looks (Seeing but Not Believing, ICLR 2026)\n",
+          f"- layers {pr['layers']} ({pr['source']}" + (f"; evidence AUROC {f(pr['mean_auroc_selected'])} vs "
+                                                        f"{f(pr['mean_auroc_all'])} over all layers, {pr['n_samples']} calibration "
+                                                        "questions" if "mean_auroc_all" in pr else "") + ")",
+          f"- alpha {hp['alpha']}, sigma {hp['sigma']}, lambda {hp['lam']}",
+          f"- **seeing but not believing** (last-token attention, test split): evidence AUROC when the answer is correct "
+          f"{f(sn['evidence_auroc_when_correct'])} / wrong {f(sn['evidence_auroc_when_wrong'])}; peak on the object "
+          f"{f(sn['found_rate_when_correct'])} / {f(sn['found_rate_when_wrong'])}; evidence / non-evidence attention per "
+          f"token in the deeper half {f(sn['evidence_over_nonevidence_deep_when_correct'], 2)}x / "
+          f"{f(sn['evidence_over_nonevidence_deep_when_wrong'], 2)}x\n"]
+    rows = _csv(os.path.join(d, "summary.csv"))
+    if rows:
+        md.append("accuracy (fixed / broken: questions turned wrong -> right / right -> wrong vs base):\n\n" + table(rows, list(rows[0])))
+    a = _csv(os.path.join(d, "attribution.csv"))
+    if a:
+        md.append("evidence attribution of the attention scores:\n\n" + table(a, ["scores", "auroc", "pointing"]))
+    bf = _csv(os.path.join(d, "by_found.csv"))
+    if bf:
+        md.append("accuracy split by whether the VEA scores peak on the object:\n\n" + table(bf, list(bf[0])))
+    md.append(img(root, os.path.join(d, "layers_rapt.png"), "evidence vs non-evidence attention")
+              + img(root, os.path.join(d, "layers_auroc.png"), "evidence AUROC per layer"))
+    vis = sorted(os.listdir(os.path.join(d, "vis")))[:2] if os.path.isdir(os.path.join(d, "vis")) else []
+    md += [img(root, os.path.join(d, "vis", v), v) for v in vis]
     return "\n".join(md) + "\n"
 
 
@@ -153,7 +185,7 @@ def main(out):
     for ds in sorted(x for x in os.listdir(out) if os.path.isdir(os.path.join(out, x)) and x != "logs"):
         d = os.path.join(out, ds)
         md += [f"## {ds}\n", p1(os.path.join(d, "p1_attention"), out), p2(os.path.join(d, "p2_knockout"), out),
-               method(os.path.join(d, "method"), out),
+               method(os.path.join(d, "method"), out), vea(os.path.join(d, "vea"), out),
                appendix(os.path.join(d, "appendix_logit_lens"), os.path.join(d, "appendix_linear_probe"), out),
                design(os.path.join(d, "appendix_design"), out)]
     path = os.path.join(out, "REPORT.md")

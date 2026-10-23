@@ -14,7 +14,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
-from rq1grounding import cues  # noqa: E402
+from rq1grounding import cues, vea  # noqa: E402
 from rq1grounding import geometry as G  # noqa: E402
 from rq1grounding.attention import AttentionRecorder, AttentionScaler, AttnEdit  # noqa: E402
 from rq1grounding.cli import reading_layers, write_jsonl  # noqa: E402
@@ -61,6 +61,18 @@ def test_recorder_matches_eager(env):
     img = prep.image_pos
     torch.testing.assert_close(rec.maps["last"].float(), ref[:, :, prep.answer_pos][..., img], atol=2e-3, rtol=1e-2)
     torch.testing.assert_close(rec.maps["object:0"].float(), ref[:, :, prep.object_pos[0]][..., img].mean(2), atol=2e-3, rtol=1e-2)
+
+
+@pytest.mark.parametrize("impl", ["eager", "sdpa"])
+def test_vea_attribution_matches_eager(env, impl):
+    m, prep = env[impl], env["prep"]
+    attn, logits = vea.last_token_attention(m, prep)
+    out = forward(env["eager"], prep, output_attentions=True)
+    ref = torch.stack([a[0, :, prep.answer_pos] for a in out.attentions]).mean(1)[:, prep.image_pos]  # [Ly, n_img]
+    np.testing.assert_allclose(attn, ref.numpy(), atol=1e-6, rtol=1e-4)
+    torch.testing.assert_close(logits, out.logits, atol=1e-4, rtol=1e-4)
+    emap = vea.evidence_map(attn.mean(0), prep.grid_h, prep.grid_w, 32)
+    assert emap.shape == (prep.image.size[1], prep.image.size[0]) and emap.max() == 1
 
 
 @pytest.mark.parametrize("impl", ["eager", "sdpa"])
