@@ -19,9 +19,9 @@ from rq1grounding import geometry as G  # noqa: E402
 from rq1grounding.attention import AttentionRecorder, AttentionScaler, AttnEdit  # noqa: E402
 from rq1grounding.cli import reading_layers, write_jsonl  # noqa: E402
 from rq1grounding.data import load_jsonl  # noqa: E402
-from rq1grounding.grounding import ground_explicit, record_attention  # noqa: E402
+from rq1grounding.grounding import record_attention  # noqa: E402
 from rq1grounding.hooks import DeepStackRecorder, VisualFeatureEditor, mrope_position_ids  # noqa: E402
-from rq1grounding.model import build_inputs, forward, greedy_generate, load_model, prepare, rope_positions  # noqa: E402
+from rq1grounding.model import forward, load_model, prepare, rope_positions  # noqa: E402
 from rq1grounding.synthetic import generate  # noqa: E402
 from tiny_model import build  # noqa: E402
 
@@ -84,16 +84,6 @@ def test_scaler_identity_and_knockout(env, impl):
     torch.testing.assert_close(ko, ref, atol=1e-4, rtol=1e-4)
     with AttentionScaler(m, [AttnEdit([1, 2], prep.text_pos, keys, "shift", 0.8, pool)]):
         assert not torch.allclose(forward(m, prep).logits, base)
-
-
-def test_greedy_generate_matches_hf(env):
-    m, proc, prep = env["eager"], env["proc"], env["prep"]
-    inputs, _ = build_inputs(m, proc, [prep.image], "Locate the circle in the image, output its bbox coordinates using JSON format.")
-    ours = greedy_generate(m, proc, inputs, max_new_tokens=8)
-    ref = m.generate(**inputs, max_new_tokens=8, do_sample=False)
-    assert ours == proc.tokenizer.decode(ref[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-    g = ground_explicit(m, proc, prep.image, "circle", max_new_tokens=8)
-    assert set(g) == {"box", "n_boxes", "raw"}
 
 
 def test_mrope_edits(env):

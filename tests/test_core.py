@@ -1,4 +1,4 @@
-"""Model-free checks: geometry, V* GT loading (official format), grounding-output parsing, attention-edit math,
+"""Model-free checks: geometry, V* GT loading (official format), attention-map metrics, attention-edit math,
 synthetic scenes.  pytest -q tests/test_core.py"""
 
 import json
@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from rq1grounding import geometry as G  # noqa: E402
 from rq1grounding.attention import edit_probs  # noqa: E402
 from rq1grounding.data import load_jsonl, load_vstar, mirror_option_idx, option_keywords, split  # noqa: E402
-from rq1grounding.grounding import auroc_rows, map_metrics, map_to_box, parse_boxes  # noqa: E402
+from rq1grounding.grounding import auroc_rows, map_metrics, map_to_box  # noqa: E402
 from rq1grounding.synthetic import generate  # noqa: E402
 
 
@@ -91,15 +91,7 @@ def test_vstar_gt_loading(vstar_root):
     assert option_keywords(b.options) == ["left", "right"]
 
 
-# ---------------------------------------------------------------------------- grounding output / maps
-
-def test_parse_qwen_boxes():
-    txt = '```json\n[\n  {"bbox_2d": [100, 200, 300, 400], "label": "glove"},\n  {"bbox_2d": [0, 0, 10, 10]}\n]\n```'
-    assert parse_boxes(txt)[0] == pytest.approx((0.1, 0.2, 0.3, 0.4)) and len(parse_boxes(txt)) == 2
-    assert parse_boxes('[{"bbox_2d": [500, 500, 600, 6') == []  # truncated, no complete box
-    assert parse_boxes('the glove is at [120, 80, 160, 90] in the image')[0] == pytest.approx((0.12, 0.08, 0.16, 0.09))
-    assert parse_boxes("I cannot find it.") == []
-
+# ---------------------------------------------------------------------------- attention maps
 
 def test_map_metrics_and_box():
     gh, gw = 6, 8

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-click runner: probes 1-3 and the method on V* and the synthetic binding set, then REPORT.md.
+# One-click runner: the two probes and the method on V* and the synthetic binding set, then REPORT.md.
 #
 #   bash run_all.sh                          # everything
 #   QUICK=1 bash run_all.sh                  # dry run: 20 questions per dataset, small synthetic set
@@ -8,11 +8,12 @@
 #
 # Steps, per dataset (V* and synthetic), in dependency order:
 #   data      generate the synthetic set; download V* if missing
-#   p1        probe 1 - does the model find the object (explicit box / attention)?  -> grounding heads, threshold
-#   p2        probe 2 - in which layers is the object read (attention knockout)?    -> reading layers
-#   p3        probe 3 - what DeepStack and MRoPE contribute to finding vs reading    (uses p1)
-#   method    self-grounded attention steering vs text / draw / crop                 (uses p1, p2)
-#   appendix  logit lens + linear probes (off by default: STEPS="... appendix ...")
+#   p1        probe 1 - does the attention find the object, also when the answer is wrong?
+#                         -> grounding heads + region threshold
+#   p2        probe 2 - is that attention used? (attention knockout: target vs control) -> reading layers
+#   method    amplify the attention on the attention-found region in the reading layers;
+#             compared with crop (ViCrop-style zoom) and with GT regions            (uses p1, p2)
+#   appendix  logit lens, linear probes, DeepStack / MRoPE ablations (off by default; uses p1)
 #   report    $OUT/REPORT.md
 # Calibration (grounding heads, thresholds, steer layers / strength) always uses a held-out split:
 # CALIB_FRAC of each dataset by default, or the synthetic set for V* with CALIB_FROM_SYNTH=1.
@@ -20,7 +21,7 @@
 # A finished step leaves <dir>/.done and is skipped next time (FORCE=1 re-runs), so a crashed or
 # interrupted run is resumed by running the same command again. Logs: $OUT/logs/<step>.log.
 # Several GPUs: run p1 first, then e.g.
-#   CUDA_VISIBLE_DEVICES=0 STEPS="p2 method" bash run_all.sh &  CUDA_VISIBLE_DEVICES=1 STEPS="p3" bash run_all.sh
+#   CUDA_VISIBLE_DEVICES=0 STEPS="p2 method" bash run_all.sh &  CUDA_VISIBLE_DEVICES=1 STEPS="appendix" bash run_all.sh
 # If huggingface.co is unreachable: export HF_ENDPOINT=https://hf-mirror.com
 
 set -uo pipefail
@@ -37,9 +38,9 @@ MAX_PIXELS=${MAX_PIXELS:-1048576}     # 1024 visual tokens (32x32 px each)
 CROP_PIXELS=${CROP_PIXELS:-262144}    # 256 extra tokens for the zoomed crop baseline
 CALIB_FRAC=${CALIB_FRAC:-0.3}
 CALIB_FROM_SYNTH=${CALIB_FROM_SYNTH:-0}
-P2_GROUPS=${P2_GROUPS:-"all last"}
+P2_GROUPS=${P2_GROUPS:-"all"}
 LIMIT=${LIMIT:-}
-STEPS=${STEPS:-"data p1 p2 p3 method report"}
+STEPS=${STEPS:-"data p1 p2 method report"}
 QUICK=${QUICK:-0}
 FORCE=${FORCE:-0}
 KEEP_GOING=${KEEP_GOING:-1}
@@ -47,7 +48,7 @@ VERBOSE=${VERBOSE:-0}
 PY=${PYTHON:-python}
 
 if [[ $QUICK == 1 ]]; then
-  LIMIT=${LIMIT:-20}; SYNTH_N=20; P2_GROUPS="all"
+  LIMIT=${LIMIT:-20}; SYNTH_N=20
   [[ $OUT == outputs/* ]] && OUT=${OUT}_quick
 fi
 want() { [[ " $STEPS " == *" $1 "* ]]; }
@@ -110,21 +111,21 @@ for dsarg in $DATASETS; do  # vstar | synthetic | path/to/samples.jsonl
   D=$OUT/$ds
   mapfile -t A < <(data_args "$dsarg")
   mapfile -t SPL < <(split_args "$dsarg")
+  want p1 && run "${ds}_p1_attention" "$D/p1_attention" $PY scripts/probe1_attention.py "${A[@]}" "${SPL[@]}" --out "$D/p1_attention"
   # shellcheck disable=SC2086
-  want p1 && run "${ds}_p1_find" "$D/p1_find" $PY scripts/probe1_find.py "${A[@]}" "${SPL[@]}" --out "$D/p1_find"
-  # shellcheck disable=SC2086
-  want p2 && run "${ds}_p2_read" "$D/p2_read" $PY scripts/probe2_read.py "${A[@]}" --groups $P2_GROUPS --out "$D/p2_read"
-  if want p3 && needs "$D/p1_find/config.json" "${ds}_p3_design"; then
-    run "${ds}_p3_design" "$D/p3_design" $PY scripts/probe3_design.py "${A[@]}" --p1 "$D/p1_find" --out "$D/p3_design"
-  fi
-  if want method && needs "$D/p1_find/config.json" "${ds}_method"; then
-    [[ -f $D/p2_read/per_sample.jsonl ]] || echo "[warn] ${ds}_method: no probe-2 results, steering falls back to middle layers"
-    run "${ds}_method" "$D/method" $PY scripts/method_steer.py "${A[@]}" "${SPL[@]}" --p1 "$D/p1_find" --p2 "$D/p2_read" \
-      --crop_pixels "$CROP_PIXELS" --out "$D/method"
+  want p2 && run "${ds}_p2_knockout" "$D/p2_knockout" $PY scripts/probe2_knockout.py "${A[@]}" --groups $P2_GROUPS --out "$D/p2_knockout"
+  if want method && needs "$D/p1_attention/config.json" "${ds}_method"; then
+    [[ -f $D/p2_knockout/per_sample.jsonl ]] || echo "[warn] ${ds}_method: no probe-2 results, steering uses the middle layers"
+    run "${ds}_method" "$D/method" $PY scripts/method_steer.py "${A[@]}" "${SPL[@]}" --p1 "$D/p1_attention" \
+      --p2 "$D/p2_knockout" --crop_pixels "$CROP_PIXELS" --out "$D/method"
   fi
   if want appendix; then
     run "${ds}_appendix_logit_lens" "$D/appendix_logit_lens" $PY scripts/appendix/logit_lens.py "${A[@]}" --out "$D/appendix_logit_lens"
     run "${ds}_appendix_linear_probe" "$D/appendix_linear_probe" $PY scripts/appendix/linear_probe.py "${A[@]}" --out "$D/appendix_linear_probe"
+    if needs "$D/p1_attention/config.json" "${ds}_appendix_design"; then
+      run "${ds}_appendix_design" "$D/appendix_design" $PY scripts/appendix/qwen3vl_design.py "${A[@]}" --p1 "$D/p1_attention" \
+        --out "$D/appendix_design"
+    fi
   fi
 done
 

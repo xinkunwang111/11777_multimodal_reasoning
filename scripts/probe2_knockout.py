@@ -1,23 +1,23 @@
-"""Probe 2 - In which layers does the answer read the object?  Layer-window attention knockout.
+"""Probe 2 - Is the attention on the object actually used?  Layer-window attention knockout.
 
-For each window of consecutive LLM layers we cut the attention from a group of text queries to
+Probe 1 asks whether the attention *finds* the object; this probe asks whether the answer *depends* on it.
+For each window of consecutive LLM layers we cut the attention from the text tokens to
   target   the visual tokens of the question's GT object(s)
   control  same-shaped boxes at random places that avoid every annotated object (same token budget)
   image    all visual tokens (how much the answer depends on vision in this window at all)
-and record the change of log p(correct option). Windows where cutting the target hurts much more than
-cutting the control are where the answer *reads* the object ("reading layers"); the method steers
-attention in exactly these layers.
+and record the change of log p(correct option).
+  * cutting the target hurts much more than cutting the control -> the attention on the object is used
+    (so amplifying it can help), and the windows where this happens are the "reading layers";
+  * the method amplifies attention in exactly these layers (chosen from the calibration questions only).
 
-Query groups: all    = every text token after the image (question, options, answer slot)
-              last   = the answer position only
-              object = the object's name tokens in the question
+Query groups: all = every text token after the image (default); last = the answer position;
+              object = the object's name tokens.
 Knockout: --mode scale -> attention weight x 0 (classic knockout)
-          --mode shift -> the target's attention is moved onto the other image tokens, so the total
-                          attention on the image is unchanged (separates "where" from "how much")
+          --mode shift -> the target's attention is moved onto the other image tokens instead, keeping the
+                          total attention on the image unchanged
 Synthetic set: when the target is cut, does probability flow to the neighbour's colour (binding leak)?
 
-Outputs: per_sample.jsonl (the method picks its layers from the calibration samples in here),
-         summary.json, knockout_<group>.png
+Outputs: per_sample.jsonl (read by the method), summary.json, knockout_<group>.png
 """
 
 import json
@@ -57,7 +57,7 @@ def main():
     p = common_parser(__doc__)
     p.add_argument("--window", type=int, default=4)
     p.add_argument("--stride", type=int, default=4)
-    p.add_argument("--groups", nargs="*", default=["all", "last"], choices=["all", "last", "object"])
+    p.add_argument("--groups", nargs="*", default=["all"], choices=["all", "last", "object"])
     p.add_argument("--mode", default="scale", choices=["scale", "shift"])
     args = p.parse_args()
     samples = load_samples(args)
@@ -100,7 +100,12 @@ def main():
         d = {r: np.array([[c[r] for c in row["knockout"][g]] for row in rows]) for r in REGIONS}
         acc = {r: np.array([[c[f"{r}_correct"] for c in row["knockout"][g]] for row in rows]).mean(0) for r in REGIONS}
         layers, ranking = reading_layers(args.out, None, g, top=1)
+        bi = windows.index(layers) if layers in windows else int(np.argmin((d["target"] - d["control"]).mean(0)))
         summary["groups"][g] = {
+            # the answer to "is the attention on the object used?", at the reading window
+            "used": {"window": windows[bi], "delta_target": float(d["target"][:, bi].mean()),
+                     "delta_control": float(d["control"][:, bi].mean()),
+                     "share_target_hurts_more": float((d["target"][:, bi] < d["control"][:, bi]).mean())},
             "delta_logp": {r: d[r].mean(0) for r in REGIONS},
             "accuracy_after_knockout": acc,
             "base_accuracy": nanmean([row["base"]["correct"] for row in rows]),
@@ -117,7 +122,7 @@ def main():
                      xlabel="LLM layer (window centre)")
     json.dump(to_jsonable(summary), open(os.path.join(args.out, "summary.json"), "w"), indent=2)
     for g, v in summary["groups"].items():
-        print(g, "reading window:", v["reading_window"])
+        print(g, "reading window:", v["reading_window"], {k: round(x, 3) if isinstance(x, float) else x for k, x in v["used"].items()})
 
 
 if __name__ == "__main__":

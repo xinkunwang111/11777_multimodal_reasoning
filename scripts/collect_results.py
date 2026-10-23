@@ -1,7 +1,7 @@
 """Collect the outputs of run_all.sh into one Markdown report: <out>/REPORT.md.
 
     python scripts/collect_results.py outputs/Qwen3-VL-8B-Instruct
-Layout read: <out>/<dataset>/{p1_find, p2_read, p3_design, method, appendix_logit_lens, appendix_linear_probe}
+Layout read: <out>/<dataset>/{p1_attention, p2_knockout, method, appendix_*}
 """
 
 import csv
@@ -11,7 +11,7 @@ import sys
 
 import numpy as np
 
-TEXT_COLS = {"mode", "condition", "source", "feature", "group", "self_found", "category", "cell"}
+TEXT_COLS = {"mode", "condition", "source", "feature", "group", "attention_found_object", "category", "cell"}
 
 
 def _json(path):
@@ -50,27 +50,24 @@ def p1(d, root):
     if not s:
         return ""
     cfg = _json(os.path.join(d, "config.json")) or {}
-    ex = s["explicit"]
-    md = ["### Probe 1 - does it find the object?\n",
+    t = s["attention_found_x_correct"]
+    md = ["### Probe 1 - does the attention find the object, even when the answer is wrong?\n",
           f"- answer accuracy {f(s['accuracy'])} (" + ", ".join(f"{k} {f(v)}" for k, v in s["accuracy_by_category"].items()) + ")",
-          f"- **explicit** (its own box): centre in GT {f(ex['center_hit'])}, IoU {f(ex['iou'])}, IoU>=0.5 {f(ex['iou>=0.5'])}, "
-          f"no box {f(ex['no_box'])}"]
-    for k, name in (("implicit_all", "implicit, all heads"), ("implicit_heads", f"implicit, {len(cfg.get('heads', []))} grounding heads")):
+          f"- object name located in the question for {f(s['name_tokens_found'])} of the objects"]
+    for k, name in (("attention_heads", f"{len(cfg.get('heads', [])) or 'all'} grounding heads"), ("attention_all_heads", "all heads")):
         if k in s:
-            md.append(f"- **{name}**: " + ", ".join(f"{m} {f(v)}" for m, v in s[k].items()))
-    md.append(f"- looks where it says (attention peak inside its own box): {f(s.get('agreement_peak_in_own_box'))}")
-    if s.get("error_types"):
-        md.append(f"- error types: {s['error_types']}" + (f"; colour-swap twins both correct {f(s['twin_both_correct'])}"
-                                                          if "twin_both_correct" in s else ""))
-    rows = []
-    for kind, t in s["found_x_correct"].items():
-        rows.append({"cell": kind, "found&correct": t["found&correct"], "found&wrong": t["found&wrong"],
-                     "not_found&correct": t["not_found&correct"], "not_found&wrong": t["not_found&wrong"],
-                     "acc if found": t["acc_if_found"], "acc if not found": t["acc_if_not_found"],
-                     "errors where found": t["share_of_errors_found"]})
-    md.append("\nfound x correct (`errors where found` = share of wrong answers whose object *was* found):\n")
-    md.append(table(rows, list(rows[0]), ["found by"] + list(rows[0])[1:]))
-    md.append(img(root, os.path.join(d, "layers_pointing.png"), "pointing per layer") + img(root, os.path.join(d, "heads.png"), "heads"))
+            md.append(f"- attention, {name}: " + ", ".join(f"{m} {f(v)}" for m, v in s[k].items()))
+    md.append(f"- **attention on the object when the answer is correct: {f(t['found_rate_when_correct'])}; "
+              f"when it is wrong: {f(t['found_rate_when_wrong'])}**")
+    if "binding_errors_with_attention_on_target" in s:
+        md.append(f"- binding errors (answered another object's colour) with the attention on the right object: "
+                  f"{f(s['binding_errors_with_attention_on_target'])}")
+    md.append(f"- error types: {s['error_types']}" + (f"; colour-swap twins both correct {f(s['twin_both_correct'])}"
+                                                      if "twin_both_correct" in s else ""))
+    rows = [{"cell": "attention found the object", "correct": t["found&correct"], "wrong": t["found&wrong"], "accuracy": t["accuracy_if_found"]},
+            {"cell": "attention missed the object", "correct": t["not_found&correct"], "wrong": t["not_found&wrong"], "accuracy": t["accuracy_if_not_found"]}]
+    md.append("\n" + table(rows, ["cell", "correct", "wrong", "accuracy"], ["", "answer correct", "answer wrong", "accuracy"]))
+    md.append(img(root, os.path.join(d, "layers.png"), "pointing per layer") + img(root, os.path.join(d, "heads.png"), "heads"))
     vis = sorted(os.listdir(os.path.join(d, "vis")))[:2] if os.path.isdir(os.path.join(d, "vis")) else []
     md += [img(root, os.path.join(d, "vis", v), v) for v in vis]
     return "\n".join(md) + "\n"
@@ -80,30 +77,20 @@ def p2(d, root):
     s = _json(os.path.join(d, "summary.json"))
     if not s:
         return ""
-    md = [f"### Probe 2 - where is the object read? (knockout: {s['mode']})\n"]
+    md = [f"### Probe 2 - is the attention on the object used? (knockout: {s['mode']})\n"]
     for g, v in s["groups"].items():
+        u = v["used"]
+        md.append(f"**queries = {g}** - base accuracy {f(v['base_accuracy'])}; reading window **{u['window']}**: cutting the "
+                  f"object changes log p(correct) by {f(u['delta_target'])} vs {f(u['delta_control'])} for the control region; "
+                  f"the object cut hurts more in {f(u['share_target_hurts_more'])} of the questions\n")
         rows = [{"cell": str(w), "target": v["delta_logp"]["target"][i], "control": v["delta_logp"]["control"][i],
                  "image": v["delta_logp"]["image"][i], "acc after target cut": v["accuracy_after_knockout"]["target"][i]}
                 for i, w in enumerate(s["windows"])]
         if "neighbor_gain_when_target_cut" in v:
             for r, gn in zip(rows, v["neighbor_gain_when_target_cut"]):
                 r["p(neighbour colour) gain"] = gn
-        md.append(f"**queries = {g}** - base accuracy {f(v['base_accuracy'])}, reading window **{v['reading_window']}**\n")
         md.append(table(rows, list(rows[0]), ["layers"] + list(rows[0])[1:]))
         md.append(img(root, os.path.join(d, f"knockout_{g}.png"), f"knockout {g}"))
-    return "\n".join(md) + "\n"
-
-
-def p3(d, root):
-    rows = _csv(os.path.join(d, "summary.csv"))
-    if not rows:
-        return ""
-    s = _json(os.path.join(d, "summary.json")) or {}
-    cols = [c for c in rows[0] if c != "condition"]
-    md = [f"### Probe 3 - DeepStack and MRoPE: find vs read ({s.get('heads', '')})\n", table(rows, ["condition"] + cols)]
-    if s.get("deepstack_injection"):
-        md.append("- DeepStack injection ||added|| / ||residual||: "
-                  + ", ".join(f"level {i}: {f(x['norm_ratio'], 2)}" for i, x in enumerate(s["deepstack_injection"])))
     return "\n".join(md) + "\n"
 
 
@@ -113,21 +100,32 @@ def method(d, root):
         return ""
     cal = _json(os.path.join(d, "calibration.json")) or {}
     srcs = [c for c in rows[0] if c not in ("mode", "mean_tokens")]
-    md = ["### Method - telling the model where to look (accuracy; columns = where the box comes from)\n"]
+    md = ["### Method - amplify the attention on the attention-found region (accuracy; columns = region source)\n"]
     if cal:
         md.append(f"- steer: layers `{cal.get('layer_set')}` {cal.get('layers')}, {cal.get('mode')} {cal.get('value')} "
                   f"(chosen on the calibration split)\n")
     md.append(table(rows, ["mode"] + srcs + ["mean_tokens"]))
-    q = _csv(os.path.join(d, "box_quality.csv"))
+    q = _csv(os.path.join(d, "region_quality.csv"))
     if q:
-        md.append("box quality per source:\n\n" + table(q, ["source", "center_hit", "iou", "no_box"]))
+        md.append("region quality:\n\n" + table(q, ["source", "center_hit", "iou", "no_region"]))
     bf = _csv(os.path.join(d, "by_found.csv"))
     if bf:
-        md.append("accuracy split by whether the model's own box found the object (self boxes):\n\n"
-                  + table(bf, list(bf[0])))
+        md.append("accuracy split by whether the attention found the object:\n\n" + table(bf, list(bf[0])))
     bc = _csv(os.path.join(d, "summary_by_category.csv"))
     if bc:
         md.append("by category:\n\n" + table(bc, ["category", "mode"] + srcs))
+    return "\n".join(md) + "\n"
+
+
+def design(d, root):
+    rows = _csv(os.path.join(d, "summary.csv"))
+    if not rows:
+        return ""
+    s = _json(os.path.join(d, "summary.json")) or {}
+    md = [f"### Appendix - DeepStack and MRoPE ablations ({s.get('heads', '')})\n", table(rows, ["condition"] + [c for c in rows[0] if c != "condition"])]
+    if s.get("deepstack_injection"):
+        md.append("- DeepStack injection ||added|| / ||residual||: "
+                  + ", ".join(f"level {i}: {f(x['norm_ratio'], 2)}" for i, x in enumerate(s["deepstack_injection"])))
     return "\n".join(md) + "\n"
 
 
@@ -154,9 +152,10 @@ def main(out):
         md.append("```\n" + open(cfg).read().strip() + "\n```\n")
     for ds in sorted(x for x in os.listdir(out) if os.path.isdir(os.path.join(out, x)) and x != "logs"):
         d = os.path.join(out, ds)
-        md += [f"## {ds}\n", p1(os.path.join(d, "p1_find"), out), p2(os.path.join(d, "p2_read"), out),
-               p3(os.path.join(d, "p3_design"), out), method(os.path.join(d, "method"), out),
-               appendix(os.path.join(d, "appendix_logit_lens"), os.path.join(d, "appendix_linear_probe"), out)]
+        md += [f"## {ds}\n", p1(os.path.join(d, "p1_attention"), out), p2(os.path.join(d, "p2_knockout"), out),
+               method(os.path.join(d, "method"), out),
+               appendix(os.path.join(d, "appendix_logit_lens"), os.path.join(d, "appendix_linear_probe"), out),
+               design(os.path.join(d, "appendix_design"), out)]
     path = os.path.join(out, "REPORT.md")
     with open(path, "w") as fh:
         fh.write("\n".join(x for x in md if x))
