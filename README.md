@@ -1,206 +1,258 @@
-# RQ1: Compositional Grounding in Qwen3-VL — 模型看对了地方，为什么还答错？
+# RQ1：Qwen3-VL 的 Compositional Grounding 探查与注意力放大
 
-RQ1 关心的是：VLM 有没有把属性和关系**绑定到正确的物体**上。比如红方块旁边有个蓝球，模型却说方块是蓝的。
+研究问题：Qwen3-VL 答错 V\* 这类视觉搜索题时，它的注意力是否其实已经落在了正确的物体上？如果是，在推理时把这份注意力放大，能否把题答对？
 
-本项目的逻辑是两个探查加一个方法：
+- **探查 1**：注意力能找到物体吗？答错时也能吗？
+- **探查 2**：这份注意力有没有被答案用到？用在哪几层？
+- **方法**：在这些层里，把注意力往"注意力自己找到的区域"上再集中一些。免训练，每题两次前向。
 
-1. **探查 1：注意力找得到物体吗？答错的时候也找得到吗？**
-   看问题里物体名对图像的注意力，是否落在 V\* 的 GT 框上，并分"答对 / 答错"两组统计。
-2. **探查 2：这份注意力有用吗？**
-   切断"文本 → 物体区域"的注意力，看答案会不会变差。同时切断一个同样大小的对照区域作比较。切物体伤得多，说明答案确实依赖它；伤得最多的那几层就是"读取层"。
-3. **方法：放大这份注意力。**
-   如果探查 1 显示"答错时注意力往往也指对了"，探查 2 显示"这份注意力被用到"，那么问题出在"看到了但用得不够"。于是在读取层里，把注意力往"注意力自己找到的区域"上再集中一些。整个方法免训练、不生成、不调工具，每题两次前向。
-
-方法与两个探查是一一对应的：放大**哪里**来自探查 1（grounding heads 给出的区域），放大**哪几层**来自探查 2（读取层），为什么值得放大由两者共同说明。
-
-> Qwen3-VL 没有 7B，稠密版本是 2B / 4B / **8B** / 32B。默认用 `Qwen/Qwen3-VL-8B-Instruct`。
+每个实验的设计细节见 [docs/DESIGN.md](docs/DESIGN.md)。本文档只讲怎么跑。
 
 ---
 
-## 0. 一键运行
+## 1. 获取代码
 
 ```bash
-pip install -r requirements.txt
-QUICK=1 bash run_all.sh     # 试跑：每个数据集 20 题
-bash run_all.sh             # 全部实验 -> outputs/Qwen3-VL-8B-Instruct/REPORT.md
+git clone -b rq1-grounding-probes https://github.com/xinkunwang111/11777_multimodal_reasoning.git
+cd 11777_multimodal_reasoning
 ```
 
-| 步骤（`STEPS`） | 脚本 | 依赖 |
-|---|---|---|
-| `data` | `scripts/make_synthetic.py`；V\* 不存在时自动下载 | — |
-| `p1` | `scripts/probe1_attention.py` | — |
-| `p2` | `scripts/probe2_knockout.py` | — |
-| `method` | `scripts/method_steer.py` | p1、p2 |
-| `appendix`（默认不跑） | `scripts/appendix/`：logit lens、线性探针、DeepStack / MRoPE 消融 | p1 |
-| `report` | `scripts/collect_results.py` → `REPORT.md` | — |
+> **必须加 `-b rq1-grounding-probes`。** 仓库在 GitHub 上的默认分支目前是一个旧分支（`claude/brave-meitner-dxs9jb`，第一版代码），不加 `-b` 会拿到旧代码。建议在 GitHub 仓库的 Settings → General → Default branch 里把默认分支改成 `rq1-grounding-probes`，然后删掉旧分支。
+>
+> 如果仓库是私有的，需要先获得访问权限，然后用 `gh auth login` 登录，或改用 SSH 地址 `git@github.com:xinkunwang111/11777_multimodal_reasoning.git`。
 
-每一步分别在 V\* 和合成集上跑一遍（`DATASETS="vstar synthetic"`）。常用环境变量：
+## 2. 安装环境
 
-| 变量 | 默认值 | 说明 |
+```bash
+conda create -n rq1 python=3.11 -y
+conda activate rq1
+
+# 先装与本机 CUDA 匹配的 PyTorch（以 CUDA 12.1 为例；其他版本见 https://pytorch.org/get-started/locally/）
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+pip install -r requirements.txt
+python -c "import transformers; print(transformers.__version__)"   # 必须 >= 4.57（Qwen3-VL 从这个版本开始支持）
+```
+
+**显卡要求**：
+- 8B 模型的 bf16 权重约 17 GB，建议单卡显存 ≥ 24 GB（如 3090 / 4090 / A5000，40 GB 或 80 GB 更宽裕）。
+- 有多张卡时，模型会自动切分到各卡上（`device_map="auto"`）。
+- 显存不够时，可以换 4B / 2B 模型，或调小 `MAX_PIXELS`（见第 9 节）。
+
+## 3. 下载 Qwen3-VL 权重
+
+Qwen3-VL 没有 7B，稠密版本是 2B / 4B / 8B / 32B。本项目默认用 **8B Instruct**。
+
+```bash
+# 方式 A：Hugging Face
+#   如果命令行里没有 hf，说明 huggingface_hub 版本较旧，把 `hf download` 换成 `huggingface-cli download`
+hf download Qwen/Qwen3-VL-8B-Instruct --local-dir checkpoints/Qwen3-VL-8B-Instruct
+
+#   国内网络连不上 huggingface.co 时，先设置镜像再执行上面的命令
+export HF_ENDPOINT=https://hf-mirror.com
+
+# 方式 B：ModelScope（魔搭）
+pip install modelscope
+modelscope download --model Qwen/Qwen3-VL-8B-Instruct --local_dir checkpoints/Qwen3-VL-8B-Instruct
+```
+
+- 其他尺寸：把模型名换成 `Qwen/Qwen3-VL-4B-Instruct`、`Qwen/Qwen3-VL-2B-Instruct` 或 `Qwen/Qwen3-VL-32B-Instruct`。
+- 之后所有命令都通过 `MODEL=checkpoints/Qwen3-VL-8B-Instruct`（一键脚本）或 `--model checkpoints/Qwen3-VL-8B-Instruct`（单独脚本）指向本地权重。
+- 如果不指定，脚本会自动下载 `Qwen/Qwen3-VL-8B-Instruct` 到 Hugging Face 缓存目录。
+
+## 4. 下载 / 生成数据
+
+```bash
+# V* Bench（191 题：direct_attributes 115 + relative_position 76），同样可以用 HF_ENDPOINT 镜像
+hf download craigwu/vstar_bench --repo-type dataset --local-dir data/vstar
+
+# 合成绑定集（300 张图，约 900 题；只用于补充分析，可以调小 --n_images）
+python scripts/make_synthetic.py --out data/synthetic --n_images 300
+```
+
+下载后 `data/vstar/` 的结构应该是：
+
+```
+data/vstar/
+  direct_attributes/   sa_xxxx.jpg + sa_xxxx.json   (target_object, bbox [x,y,w,h], question, options)
+  relative_position/   ...
+  test_questions.jsonl                              (官方选项顺序；有它时准确率可与 lmms-eval 对比)
+```
+
+一键脚本的 `data` 步骤会自动完成这两件事，这里手动执行也可以。
+
+## 5. 启动前自检（约 1 分钟）
+
+```bash
+python scripts/check_setup.py --model checkpoints/Qwen3-VL-8B-Instruct --data_root data/vstar
+```
+
+这个脚本会：
+- 打印 torch / transformers 版本和可用的 GPU；
+- 加载模型，每个类别答 1 道题；
+- 打印问题和选项、模型的答案、视觉 token 网格的大小、物体名 token 的注意力是否落在 GT 框上，以及切断这份注意力后答案概率的变化。
+
+最后看到 `OK - setup works` 就说明环境、权重、数据和注意力工具都正常。
+
+## 6. 运行实验
+
+### 6.1 一键运行（推荐）
+
+```bash
+export MODEL=checkpoints/Qwen3-VL-8B-Instruct
+QUICK=1 bash run_all.sh      # 先试跑：每个数据集 20 题，确认整条流程能通
+bash run_all.sh              # 全量；结果汇总在 outputs/Qwen3-VL-8B-Instruct/REPORT.md
+```
+
+默认会依次执行下表中除 `appendix` 外的步骤，每一步都在 V\* 和合成集上各跑一遍：
+
+| 步骤 | 做什么 | 脚本 | 依赖 |
+|---|---|---|---|
+| `data` | 生成合成集；V\* 不存在时自动下载 | `scripts/make_synthetic.py` | — |
+| `p1` | 探查 1：注意力能找到物体吗，答错时也能吗？ | `scripts/probe1_attention.py` | — |
+| `p2` | 探查 2：切断物体上的注意力，答案变差吗？在哪几层？ | `scripts/probe2_knockout.py` | — |
+| `method` | 方法：在读取层放大注意力找到的区域，与 crop 和 GT 区域对比 | `scripts/method_steer.py` | p1、p2 |
+| `appendix` | 附录（默认不跑）：DeepStack / MRoPE 消融、logit lens、线性探针 | `scripts/appendix/*.py` | p1 |
+| `report` | 汇总成 `REPORT.md` | `scripts/collect_results.py` | — |
+
+常用写法：
+
+```bash
+STEPS="p1 p2 method report" bash run_all.sh                 # 只跑部分步骤
+STEPS="data p1 p2 method appendix report" bash run_all.sh   # 连附录一起跑
+DATASETS="vstar" bash run_all.sh                            # 只跑 V*
+CALIB_FROM_SYNTH=1 bash run_all.sh                          # V* 用合成集做校准（默认用 V* 自身 30% 的题）
+MAX_PIXELS=4194304 OUT=outputs/8b_4096tok bash run_all.sh   # 换分辨率（4096 个视觉 token）另跑一组
+```
+
+| 环境变量 | 默认值 | 说明 |
 |---|---|---|
-| `MAX_PIXELS` | 1048576 | 全图预算，即 1024 个视觉 token（每个 32×32 px） |
-| `CROP_PIXELS` | 262144 | crop 对照组额外的 256 个 token |
-| `CALIB_FRAC` | 0.3 | 校准集比例；`CALIB_FROM_SYNTH=1` 则让 V\* 用合成集校准 |
-| `LIMIT` | 全部 | 每个数据集的题数上限 |
-| `QUICK` | 0 | 1 = 试跑 |
-| `FORCE` | 0 | 1 = 忽略 `.done`，全部重跑 |
+| `MODEL` | `Qwen/Qwen3-VL-8B-Instruct` | 本地权重目录或 HF 模型名 |
+| `OUT` | `outputs/<模型目录名>` | 输出目录 |
+| `DATASETS` | `vstar synthetic` | 要跑的数据集 |
+| `VSTAR_ROOT` / `SYNTH_ROOT` | `data/vstar` / `data/synthetic` | 数据位置 |
+| `MAX_PIXELS` | 1048576 | 每张图的像素预算；1 个视觉 token = 32×32 px，所以默认是 1024 个 token |
+| `CROP_PIXELS` | 262144 | crop 对照组额外使用的 256 个 token |
+| `CALIB_FRAC` | 0.3 | 校准集比例（grounding heads、阈值、放大的层和强度都只在校准集上选） |
+| `LIMIT` | 全部 | 每个数据集最多跑多少题 |
+| `SYNTH_N` | 300 | 合成集图片数 |
+| `QUICK` | 0 | 1 = 试跑（每个数据集 20 题） |
+| `FORCE` | 0 | 1 = 忽略已完成标记，全部重跑 |
 | `KEEP_GOING` | 1 | 0 = 遇到第一个失败就停 |
 | `VERBOSE` | 0 | 1 = 日志同时打印到终端 |
+| `PYTHON` | `python` | 使用的 Python 解释器 |
 
-完成的步骤会写 `.done` 标记，中断后重跑同一条命令即可续跑。日志在 `$OUT/logs/`。访问不了 HF 时：`export HF_ENDPOINT=https://hf-mirror.com`。
+**断点续跑**：每完成一步会在输出目录里写一个 `.done` 文件。中断后重新执行同一条命令，已完成的步骤会被跳过。每一步的日志在 `$OUT/logs/<步骤>.log`，失败时终端会打印日志的最后几行。
 
----
+**多卡并行**：先跑完 `p1`，然后其余步骤可以分到不同的卡上：
 
-## 1. 数据与 GT 约定
-
-**V\* Bench**（`craigwu/vstar_bench`）的每张图配一个 JSON：
-
-```
-{"target_object": [名字...], "bbox": [[x, y, w, h] 原图像素...], "question": ..., "options": [正确项, ...]}
+```bash
+CUDA_VISIBLE_DEVICES=0 STEPS="p2 method" bash run_all.sh &
+CUDA_VISIBLE_DEVICES=1 STEPS="appendix" bash run_all.sh &
 ```
 
-| 场景 | 处理方式（`data.py`） |
+### 6.2 单独运行某个实验
+
+```bash
+M=checkpoints/Qwen3-VL-8B-Instruct
+D="--dataset vstar --data_root data/vstar"   # 换成合成集：--dataset synthetic --data_root data/synthetic
+
+# 探查 1（会写出 config.json：grounding heads + 区域阈值，供方法使用）
+python scripts/probe1_attention.py --model $M $D --out outputs/run1/vstar/p1_attention
+
+# 探查 2（会写出逐题的切断结果，方法从中选出读取层）
+python scripts/probe2_knockout.py --model $M $D --out outputs/run1/vstar/p2_knockout
+
+# 方法（需要探查 1、2 的输出）
+python scripts/method_steer.py --model $M $D --p1 outputs/run1/vstar/p1_attention \
+    --p2 outputs/run1/vstar/p2_knockout --out outputs/run1/vstar/method
+
+# 附录（可选）
+python scripts/appendix/qwen3vl_design.py --model $M $D --p1 outputs/run1/vstar/p1_attention --out outputs/run1/vstar/appendix_design
+python scripts/appendix/logit_lens.py     --model $M $D --out outputs/run1/vstar/appendix_logit_lens
+python scripts/appendix/linear_probe.py   --model $M $D --out outputs/run1/vstar/appendix_linear_probe
+
+# 汇总：参数是 <数据集名> 目录的上一级 -> outputs/run1/REPORT.md
+python scripts/collect_results.py outputs/run1
+```
+
+如果想把这些结果和一键运行的结果放在一起，输出目录要沿用 `<OUT>/<数据集名>/<实验名>` 的结构，`collect_results.py` 按这个结构读取。
+
+所有脚本的通用参数：
+
+| 参数 | 说明 |
 |---|---|
-| `direct_attributes` | 1 个物体 |
-| `relative_position` | 2 个物体，顺序为 [主体, 参照物]；每个物体的注意力只和**自己的框**比 |
-| 同名的多个 box | 视为同一物体的多个实例 |
-| box 越界 / 退化 | 越界部分裁掉，退化的 box 丢弃 |
-| 名字和 box 数量对不上 | 记录到 `meta.gt_warning` |
-| 选项顺序 | 若存在 `test_questions.jsonl`，使用官方选项顺序和答案字母（可与 lmms-eval 对比）；否则按 qid 确定性打乱 |
+| `--model` | 本地权重目录或 HF 模型名 |
+| `--dataset` / `--data_root` | `vstar` 或 `synthetic`（也可以直接给一个 samples.jsonl 路径），以及数据目录 |
+| `--max_pixels` | 每张图的像素预算 |
+| `--limit` | 最多跑多少题 |
+| `--categories` | 只跑某些类别，如 `direct_attributes` |
+| `--dtype` | 默认 `bfloat16` |
+| `--out` | 输出目录 |
 
-**统一坐标**（`geometry.py`）：全项目只用"相对原图的归一化 xyxy"。V\* 的像素 xywh、文本提示用的 Qwen 0–1000 坐标、画框用的像素坐标，都在这里转换。
+各脚本的主要专有参数（完整列表见 `python scripts/<脚本> -h`）：
 
-**GT → token 网格**：输入图先按 32 的倍数缩放，token 网格就是精确已知的。与 GT 框有任何重叠的 32 px cell 都算目标 token，所以比一个 token 还小的物体（V\* 中常见）也至少占有一个 cell。
+| 脚本 | 参数 |
+|---|---|
+| `probe1_attention.py` | `--calib_frac 0.3`（或 `--calib_dataset synthetic --calib_root data/synthetic`）、`--top_heads 8`、`--sink_k 5`、`--n_vis 12` |
+| `probe2_knockout.py` | `--window 4 --stride 4`（层窗口）、`--groups all`（也可以加 `last object`）、`--mode scale`（`shift` = 保持图像总注意力不变的切断） |
+| `method_steer.py` | `--lambdas 0.25 0.5 0.75`（放大强度候选）、`--steer_mode shift`、`--modes steer crop`（还可加 `text draw`）、`--sources attn gt`、`--crop_pixels`、`--pad` |
 
-**合成绑定集**（`synthetic.py`）：
-- 每张图 6–10 个小形状。目标的形状唯一，并且没有其他物体与它同色；目标旁边紧贴一个异色**邻居**。
-- 4 个选项的来源都已知：target / neighbor（绑定错误） / in_image / absent（幻觉）。
-- 每个场景配一张**颜色互换孪生图**，答案必须随之改变。
-- 另有关系题。GT 格式与 V\* 一致。
+## 7. 结果在哪里，先看什么
 
----
+```
+outputs/Qwen3-VL-8B-Instruct/
+  REPORT.md                  <- 所有结果的汇总（表格 + 图），先看这个
+  logs/                      <- 每个步骤的日志和本次运行的配置
+  vstar/  synthetic/
+    p1_attention/  summary.json  config.json  layers.png  heads.png  vis/*.png  per_sample.jsonl
+    p2_knockout/   summary.json  knockout_all.png  per_sample.jsonl
+    method/        summary.csv  by_found.csv  region_quality.csv  summary_by_category.csv  calibration.json
+    appendix_*/    （如果跑了附录）
+```
 
-## 2. 探查 1：注意力找得到物体吗？答错时也找得到吗？（`probe1_attention.py`）
+按研究逻辑，依次回答三个问题：
 
-**度量方式**：
-- 对问题里每个物体，取其名字**全部 token** 对图像 token 的注意力，并去掉 attention sink（残差范数异常大、无论问什么都吸走注意力的 token）。
-- 与该物体的 GT 框比较，计算：
-  - **pointing**：注意力峰值是否落在物体上。这就是"注意力找到了物体"的定义，不需要阈值；
-  - AUROC（0.5 = 随机）；
-  - lift（框内注意力 ÷ 框面积占比，1 = 随机）；
-  - own>other（看自己多于看别的物体）。
-- 以上指标逐层、逐头都会计算。
-- 在**校准集**上选出定位最好的 k 个 **grounding heads**，并校准"注意力图 → 区域"的阈值（保留 ≥ t·峰值、包含峰值的连通块，t 取使 IoU 最高的值）。方法会用到这两样东西。
-
-**关键输出**（测试集）：
-- **注意力找到物体的比例：答对时 vs 答错时**；
-- 2×2 表：注意力找到 / 没找到 × 答对 / 答错；
-- 合成集上的绑定错误（答成了邻居的颜色）中，注意力其实落在目标上的比例；
-- `layers.png`：逐层 pointing，分答对 / 答错两条曲线。
-
-## 3. 探查 2：这份注意力有用吗？（`probe2_knockout.py`）
-
-**做法**：
-- 按层窗口（默认每 4 层一个窗口），切断图像之后全部文本 token 对三类 key 的注意力：
-  - **目标**：GT 物体的 token；
-  - **对照**：同形状、随机位置、避开所有物体的框；
-  - **全图**：全部视觉 token。
-- 记录 Δlog p(正确选项)。
-
-**输出**：
-- 切目标比切对照伤得多，说明答案确实在用"物体上的注意力"。summary 中的 `used` 字段给出读取窗口内两者的平均变化，以及"切目标伤得更多"的题目比例。
-- 伤得最多的窗口就是**读取层**，方法只在这里放大。
-- 合成集上还会看：切断目标后，概率是否流向邻居的颜色。
-
----
-
-## 4. 方法：放大注意力自己找到的区域（`method_steer.py`）
-
-每题两次前向，不训练、不生成、不调工具：
-1. **正常前向**：得到 base 答案，同时读出物体名的注意力（探查 1 的 grounding heads）→ 峰值所在的连通区域。
-2. **放大前向**：输入完全相同，只在读取层（探查 2）里，把文本 token 看图像时"其他区域"注意力的 λ 比例移到这个区域上。
-
-**对比**（`summary.csv`；行 = 怎么用这个区域，列 = 区域从哪来）：
-
-| | attn（注意力自己找的，ours） | gt（GT 框，上界） |
+| 问题 | 看哪里 | 看什么 |
 |---|---|---|
-| base（不用区域） | | |
-| base_hi（全图放大到与 crop 相同的 token 数，等算力对照） | | |
-| **steer（ours）**：只改读取层的注意力，不改输入 | | |
-| crop：[全图, 该区域的高清裁剪]，即 ViCrop 式的输入放大，需要额外 token | | |
-| 可选：text（区域坐标写进 prompt）、draw（在图上画框，颜色避开选项） | | |
+| 答错时注意力也找到了物体吗？ | `p1_attention/summary.json` → `attention_found_x_correct` | `found_rate_when_wrong`（答错时注意力落在物体上的比例），与 `found_rate_when_correct` 对比；`layers.png` 按答对 / 答错分开画了逐层曲线 |
+| 这份注意力被用到了吗？ | `p2_knockout/summary.json` → `groups.all.used` | `delta_target` 是否明显比 `delta_control` 更负；`share_target_hurts_more` 是切物体比切对照伤得更多的题目比例；`window` 是读取层 |
+| 放大有用吗？ | `method/summary.csv` | `steer` 行的 `attn` 列与 `base`、`base_hi`、`crop` 比较；`gt` 列是区域完全正确时的上界 |
+| 收益来自哪里？ | `method/by_found.csv` | 收益应主要出现在"注意力找到了物体"的那组题上 |
 
-- `by_found.csv` 把收益拆到"注意力找到 / 没找到物体"两组。按方法的逻辑，它应当主要在"找到了"的题上起作用；"没找到"的题它修不了，这正是方法的边界。
-- `region_quality.csv` 给出区域的定位质量。
+## 8. 计算量（前向次数）
 
-**层和 λ 只在校准集上选**：候选层集合是探查 2 在校准题上算出的读取窗口（取前 1 / 前 2 个），再加中间三分之一的层、全部层；λ ∈ {0.25, 0.5, 0.75}。
+以 8B 模型（36 层）、默认参数估算：
 
----
+| 实验 | 每道题的前向次数 | V\*（191 题） |
+|---|---|---|
+| 探查 1 | 1 | 191 |
+| 探查 2 | 1 + 9 个层窗口 × 3 个区域 = 28 | 约 5.3k |
+| 方法 | 校准题 1 + 12，测试题 6 | 约 1.5k（30% 校准） |
+| 附录 DeepStack / MRoPE | 8 | 约 1.5k |
 
-## 5. 注意力的"探针 / 放大 / 缩小"实现（`attention.py`）
+合成集默认约 900 题，耗时主要在探查 2。可以用 `SYNTH_N=100` 或 `LIMIT=...` 缩小。所有前向都不保留 KV cache，每次只处理一道题。
 
-**一个包装，读写两用**：
-- 包装的是 LLM 层的注意力 kernel（sdpa / flash / eager 都适用），拿到 RoPE 之后的 q、k、v，**只对选中的 query 行用 fp32 重算**，其余行保持原结果。
-- 不需要 eager，也不需要生成 L×L 矩阵。
-- `AttentionRecorder` 读注意力（探查 1），`AttentionScaler` 改注意力（探查 2 的切断、方法的放大）。
+## 9. 常见问题
 
-**两种编辑语义**（作用在每个 head、每个 query 行的 softmax 概率上）：
-- `scale(a)`：目标 key 上的权重 ×a 后重新归一化。a=0 是 knockout（探查 2 默认用这个），0<a<1 是缩小，a>1 是放大。
-- `shift(λ)`：
-  - λ>0：把"图像其他区域"注意力的 λ 比例移到目标上；
-  - λ<0：把目标注意力移回其他区域；λ=−1 是图像总注意力不变的 knockout。
-  - 文本注意力和图像总注意力**完全不变**，目标内部的相对权重也保持不变。
+| 现象 | 解决办法 |
+|---|---|
+| `KeyError: 'qwen3_vl'` 或模型类型无法识别 | transformers 太旧：`pip install -U "transformers>=4.57"` |
+| 下载很慢或失败 | `export HF_ENDPOINT=https://hf-mirror.com`，或改用 ModelScope 下载权重 |
+| 显存不足（CUDA OOM） | 调小 `MAX_PIXELS`（如 `524288` = 512 个 token），或换 `Qwen3-VL-4B-Instruct`，或用多卡 |
+| clone 下来没有 `scripts/probe1_attention.py` | clone 了旧的默认分支，执行 `git checkout rq1-grounding-probes` |
+| 某一步失败 | 看 `$OUT/logs/<步骤>.log`；修好后重新执行同一条命令即可续跑 |
+| 想重跑某一步 | 删掉该步骤输出目录里的 `.done`，或 `FORCE=1` 全部重跑 |
 
-**方法用 `shift` 的原因**：
-- 只改变"看图像的哪里"，不改变"多依赖图像"，效果可以干净地归因到位置上；
-- 它对目标大小自适应：小目标原本的注意力接近 0，乘一个固定倍数几乎没有作用。
+## 10. 离线测试（不需要 GPU 和网络）
 
-**测试验证**：
-- 记录的注意力与 eager 的 `output_attentions` 逐元素一致；
-- 全层 knockout 等价于用 4D mask 屏蔽同样位置的 eager 前向（sdpa / eager 两种实现都测了）；
-- `scale(1)` / `shift(0)` 不改变输出。
-
-## 6. 防泄漏协议
-
-- grounding heads、区域阈值、steer 的层和 λ，都只在校准集上选。
-- 读取层由方法自己从探查 2 的逐题结果里，**只用校准题**重新计算。
-- 划分方式是按 qid（孪生图和同图的关系题按 pair_id）哈希，在所有脚本里一致。
-
-## 7. 代码结构
-
-```
-rq1grounding/
-  data.py        Sample / GTObject，V* 加载（官方格式 + 官方选项顺序），合成集读取，划分，prompt
-  geometry.py    坐标转换、IoU、GT→token 网格、区域 token
-  synthetic.py   绑定场景生成
-  model.py       加载，按预算缩放，(多图) 输入，问题 / 物体 token 定位，选项打分
-  attention.py   AttentionRecorder / AttentionScaler（scale、shift）
-  grounding.py   注意力 query 组、sink 去除、指标、grounding heads、注意力图→区域
-  cues.py        区域的用法：steer / crop / text / draw
-  hooks.py       残差范数与 sink 检测、DeepStack 消融、MRoPE 位置编辑、logit lens（附录用）
-  cli.py, viz.py
-scripts/  make_synthetic.py  probe1_attention.py  probe2_knockout.py  method_steer.py  collect_results.py
-          appendix/{logit_lens, linear_probe, qwen3vl_design}.py
-tests/    test_core.py  test_model.py  test_pipeline.py（模拟 V* 格式的端到端测试）
+```bash
+pytest -q tests
 ```
 
-`pytest -q tests` 全部离线运行，CPU 上大约 1.5 分钟。
+测试会在 CPU 上构建一个随机初始化的微型 Qwen3-VL，验证以下内容：
+- 注意力的记录和切断与模型自身的 eager 注意力完全一致；
+- V\* 标注格式的读取正确；
+- 整条流程能端到端跑通（用 V\* 格式的模拟数据）。
 
-## 8. 相关工作与定位
-- **ViCrop**（ICLR 2025）："MLLMs know where to look"，答错时注意力也常指对，并据此裁剪放大。我们在 Qwen3-VL 上检验这一前提（探查 1），并把它作为 crop 对照组。
-- **Kang et al.**（CVPR 2025）：少数头即可定位。对应 grounding heads。
-- **See What You Are Told**（ICLR 2025）：attention sink。
-- **PAI**（ECCV 2024）：全图统一放大图像注意力。
-- **ControlMLLM**（NeurIPS 2024）：在用户给定的区域上，用测试时优化放大注意力。这是与本方法最接近的工作。
-- **Cross-modal information flow**（CVPR 2025）：attention knockout 方法。
-
-本方法的差异：
-- 区域来自**模型自己的注意力**，不需要用户给框，也不需要优化；
-- 只在**探查确认的读取层**放大；
-- 用 `shift`，不改变图像总注意力；
-- 与 crop 做了等算力比较。
-
-## 9. 注意事项
-- 方法是否值得用，取决于探查 1 的结果。如果答错时注意力也大多没找到物体，放大就没有意义，这时瓶颈在定位或分辨率（crop 可能更有效）。这本身也是一个结论。
-- V\* 原图约 2246×1582，目标常常不足一个 token。可以改 `MAX_PIXELS` 多跑几组，看分辨率如何影响"找到"和"答对"。
-- 测试用的是随机初始化的微型模型，只验证代码正确性。
+修改代码后先跑一遍测试。
