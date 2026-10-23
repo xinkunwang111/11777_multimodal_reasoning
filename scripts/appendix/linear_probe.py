@@ -1,4 +1,4 @@
-"""Probe 3 - Where is the attribute / position information, and is it bound to the right tokens?
+"""Appendix B - Where is the attribute / position information, and is it bound to the right tokens?
 
 Extracts per-layer residual features and trains linear probes (cross-validated):
 
@@ -25,7 +25,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from rq1grounding.cli import common_parser, to_jsonable  # noqa: E402
 from rq1grounding.data import option_keywords  # noqa: E402
 from rq1grounding.viz import layer_curves  # noqa: E402
@@ -34,28 +34,31 @@ TOKEN_FEATS = ("inbox", "outbox", "distractor", "objword", "answer")
 
 
 def extract(args):
-    from rq1grounding.cli import setup
+    from rq1grounding.cli import load_samples, setup
+    from rq1grounding import geometry as G
     from rq1grounding.hooks import HiddenStateRecorder, VisualFeatureEditor
     from rq1grounding.model import answer_from_logits, forward, prepare
 
-    model, processor, samples = setup(args)
+    samples = load_samples(args)
+    model, processor = setup(args)
     rng = np.random.default_rng(args.seed)
     feats = {k: [] for k in TOKEN_FEATS}
     vit, pos_X, pos_y, pos_g, meta = {}, [], [], [], []
     for si, s in enumerate(tqdm(samples)):
         prep = prepare(model, processor, s, args.max_pixels, args.min_pixels)
-        cov = prep.cov_flat
+        cov = prep.gt_cov()
         inb, rest = np.flatnonzero(cov > 0), np.flatnonzero(cov == 0)
         if len(inb) == 0:
             continue
         inb = rng.choice(inb, min(len(inb), args.max_tokens), replace=False)
         outb = rng.choice(rest, min(len(rest), len(inb)), replace=False)
         dis = np.array([], dtype=int)
-        if prep.distractor_coverage is not None:
-            d = np.flatnonzero(prep.distractor_coverage.reshape(-1) > 0)
+        dis_boxes = [tuple(s.meta["neighbor"]["box"])] if "neighbor" in s.meta else [tuple(b) for b in s.meta.get("other_boxes", [])]
+        if dis_boxes:
+            d = np.setdiff1d(G.region_tokens(dis_boxes, prep.grid_h, prep.grid_w), np.flatnonzero(cov > 0))
             dis = rng.choice(d, min(len(d), args.max_tokens), replace=False) if len(d) else dis
         pp = rng.choice(prep.n_img, min(prep.n_img, args.pos_tokens), replace=False)
-        obj = [v[-1] for v in prep.object_pos.values() if v][:1]
+        obj = [v[-1] for v in prep.object_pos if v][:1]
         groups = {"inbox": inb, "outbox": outb, "distractor": dis, "pos": pp}
         img_pos = prep.image_pos.cpu().numpy()
         seq = np.concatenate([img_pos[g] for g in groups.values()] + [np.array(obj + [prep.answer_pos])])
@@ -185,7 +188,6 @@ def main():
     p.add_argument("--pos_layer_stride", type=int, default=4)
     p.add_argument("--C", type=float, default=0.05, help="inverse L2 strength of the logistic probe")
     p.add_argument("--min_class_count", type=int, default=4)
-    p.add_argument("--seed", type=int, default=0)
     p.add_argument("--skip_extract", action="store_true")
     args = p.parse_args()
     os.makedirs(args.out, exist_ok=True)

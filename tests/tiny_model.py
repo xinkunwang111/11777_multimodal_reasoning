@@ -1,7 +1,7 @@
 """Build a tiny random Qwen3-VL (+ a toy tokenizer/processor) for offline CPU smoke tests.
 
     python tests/tiny_model.py /tmp/tiny-qwen3vl
-    python scripts/01_attention_grounding.py --model /tmp/tiny-qwen3vl --dtype float32 ...
+    python scripts/probe1_find.py --model /tmp/tiny-qwen3vl --dtype float32 --dataset synthetic ...
 """
 
 import sys

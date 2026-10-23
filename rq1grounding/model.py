@@ -1,9 +1,9 @@
-"""Loading Qwen3-VL and turning a Sample into model inputs plus a token layout.
+"""Loading Qwen3-VL, building inputs and the token layout, answering and greedy generation.
 
-Qwen3-VL image tokens: ViT patch = 16px, a 2x2 spatial merge -> one LLM token per
-32x32 pixel cell, emitted in raster order of the merged grid. We pre-resize the
-image to a multiple of 32 under a pixel budget so the processor does not resize
-again and the token grid is known exactly.
+Qwen3-VL image tokens: ViT patch = 16 px, 2x2 spatial merge -> one LLM token per 32x32 px cell,
+emitted in raster order. Images are pre-resized to a multiple of 32 under a pixel budget, so the
+processor does not resize again and the token grid is known exactly; a normalized GT box maps
+onto that grid directly (geometry.coverage).
 """
 
 from __future__ import annotations
@@ -15,7 +15,8 @@ import numpy as np
 import torch
 from PIL import Image
 
-from .data import LETTERS, Sample, bbox_coverage_grid, build_prompt
+from . import geometry as G
+from .data import LETTERS, Sample, build_prompt
 
 DEFAULT_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
 
@@ -28,8 +29,12 @@ def load_model(model_id: str = DEFAULT_MODEL, dtype: str = "bfloat16", device_ma
         model_id, dtype=getattr(torch, dtype), device_map=device_map, attn_implementation=attn_implementation
     ).eval()
     model.requires_grad_(False)
-    processor = AutoProcessor.from_pretrained(model_id)
-    return model, processor
+    return model, AutoProcessor.from_pretrained(model_id)
+
+
+def token_factor(model) -> int:
+    v = model.config.vision_config
+    return v.patch_size * v.spatial_merge_size
 
 
 def resize_to_budget(img: Image.Image, max_pixels: int, min_pixels: int, factor: int) -> Image.Image:
@@ -41,23 +46,18 @@ def resize_to_budget(img: Image.Image, max_pixels: int, min_pixels: int, factor:
         scale = math.sqrt(min_pixels / (w * h))
     nw = max(factor, int(w * scale) // factor * factor)
     nh = max(factor, int(h * scale) // factor * factor)
-    return img.resize((nw, nh), Image.BICUBIC)
-
-
-def token_factor(model) -> int:
-    v = model.config.vision_config
-    return v.patch_size * v.spatial_merge_size
+    return img if (nw, nh) == img.size else img.resize((nw, nh), Image.BICUBIC)
 
 
 @dataclass
 class ImageSpan:
-    pos: torch.Tensor  # sequence positions of this image's tokens (raster order over the merged grid)
+    pos: torch.Tensor  # sequence positions of the image's tokens, raster order over its merged grid
     grid_h: int
     grid_w: int
 
 
 def build_inputs(model, processor, images: list[Image.Image], prompt: str):
-    """Chat-formatted inputs for [image_1, ..., image_k, prompt] and the token span of every image."""
+    """Chat-formatted inputs for [image_1, ..., image_k, prompt] plus the token span of every image."""
     content = [{"type": "image"} for _ in images] + [{"type": "text", "text": prompt}]
     text = processor.apply_chat_template([{"role": "user", "content": content}], tokenize=False,
                                          add_generation_prompt=True)
@@ -66,41 +66,65 @@ def build_inputs(model, processor, images: list[Image.Image], prompt: str):
     all_pos = (inputs["input_ids"][0] == model.config.image_token_id).nonzero().squeeze(-1)
     spans, o = [], 0
     for _, h, w in inputs["image_grid_thw"].tolist():
-        gh, gw = h // merge, w // merge
-        spans.append(ImageSpan(all_pos[o:o + gh * gw], gh, gw))
-        o += gh * gw
+        spans.append(ImageSpan(all_pos[o:o + (h // merge) * (w // merge)], h // merge, w // merge))
+        o += (h // merge) * (w // merge)
     assert o == all_pos.numel(), (o, all_pos.numel())
     return inputs, spans
 
 
 @dataclass
 class Prepared:
+    """Model inputs for one question plus everything needed to relate tokens to GT."""
     sample: Sample
     inputs: dict
-    image: Image.Image  # the resized image actually fed to the model
-    grid_h: int
-    grid_w: int
-    image_pos: torch.Tensor  # sequence positions of the gh*gw image tokens (raster order)
-    answer_pos: int  # last prompt position, whose logits give the answer letter
-    coverage: np.ndarray  # [gh, gw] fraction of each token cell inside the union of target boxes
-    object_pos: dict = field(default_factory=dict)  # object name -> positions of its tokens in the question
-    letter_ids: list = field(default_factory=list)
-    distractor_coverage: np.ndarray | None = None
-    question_pos: list = field(default_factory=list)  # all tokens of the question sentence
-    object_spans: list = field(default_factory=list)  # aligned with sample.target_objects
-    object_cov: list = field(default_factory=list)  # per-object coverage grid (own box), aligned likewise
-    spans: list = field(default_factory=list)  # ImageSpan per image (1 unless zoom inputs)
+    image: Image.Image  # main image as fed to the model (resized)
+    spans: list  # ImageSpan per image; spans[0] is the main image
+    answer_pos: int  # last prompt position: its logits give the option letter
+    letter_ids: list
+    question_pos: list = field(default_factory=list)  # tokens of the question sentence
+    object_pos: list = field(default_factory=list)  # per sample.objects: tokens of its name inside the question
+
+    @property
+    def grid_h(self) -> int:
+        return self.spans[0].grid_h
+
+    @property
+    def grid_w(self) -> int:
+        return self.spans[0].grid_w
 
     @property
     def n_img(self) -> int:
         return self.grid_h * self.grid_w
 
     @property
-    def cov_flat(self) -> np.ndarray:
-        return self.coverage.reshape(-1)
+    def image_pos(self) -> torch.Tensor:
+        return self.spans[0].pos
+
+    @property
+    def text_pos(self) -> list:
+        """Text positions after the last image (question, options, chat suffix, answer position)."""
+        return list(range(min(int(self.spans[-1].pos[-1]) + 2, self.answer_pos), self.answer_pos + 1))
+
+    # ---- GT on the main image's token grid
+    def object_cov(self, k: int) -> np.ndarray:
+        return G.coverage(self.sample.objects[k].boxes, self.grid_h, self.grid_w).reshape(-1)
+
+    def gt_cov(self) -> np.ndarray:
+        return G.coverage(self.sample.boxes, self.grid_h, self.grid_w).reshape(-1)
+
+    def other_cov(self, k: int) -> np.ndarray | None:
+        """Coverage of everything that is *not* object k: other question objects + annotated distractors."""
+        boxes = [b for j, o in enumerate(self.sample.objects) if j != k for b in o.boxes]
+        boxes += [tuple(b) for b in self.sample.meta.get("other_boxes", [])]
+        return G.coverage(boxes, self.grid_h, self.grid_w).reshape(-1) if boxes else None
+
+    def tokens_of(self, boxes, pad: int = 0) -> np.ndarray:
+        """Sequence positions of the main-image tokens overlapping the boxes."""
+        idx = G.region_tokens(boxes, self.grid_h, self.grid_w, pad)
+        return self.image_pos.cpu().numpy()[idx]
 
 
-def _token_char_spans(tokenizer, ids: list[int]):
+def _char_spans(tokenizer, ids):
     spans, text = [], ""
     for i in ids:
         piece = tokenizer.decode([i])
@@ -109,80 +133,82 @@ def _token_char_spans(tokenizer, ids: list[int]):
     return text, spans
 
 
-def _positions_in(spans, start: int, k: int, n: int) -> list[int]:
-    return [start + j for j, (a, b) in enumerate(spans) if a < k + n and b > k]
-
-
-def find_word_positions(tokenizer, input_ids: list[int], word: str, start: int) -> list[int]:
-    """Positions (>= start) of the tokens spelling `word` (last occurrence in the prompt)."""
-    text, spans = _token_char_spans(tokenizer, input_ids[start:])
-    low = text.lower()
-    for cand in (word.lower(), word.lower().split()[-1]):
-        k = low.rfind(cand)
-        if k >= 0:
-            return _positions_in(spans, start, k, len(cand))
-    return []
-
-
-def locate_question(tokenizer, input_ids: list[int], question: str, objects: list[str], start: int):
-    """Token positions of the question sentence and of each object phrase *inside the question*
-    (options such as "The cup is left of the dog" must not be picked up as the object query)."""
-    text, spans = _token_char_spans(tokenizer, input_ids[start:])
+def locate_question(tokenizer, input_ids: list[int], question: str, names: list[str], start: int):
+    """Token positions of the question sentence and of each object name *inside* the question
+    (so an option such as "The cup is left of the dog" is never taken as the object query)."""
+    text, spans = _char_spans(tokenizer, input_ids[start:])
     low, q = text.lower(), question.lower().strip()
     q0 = low.find(q)
-    q_pos = _positions_in(spans, start, q0, len(q)) if q0 >= 0 else []
-    obj_spans = []
-    for o in objects:
+    lo, hi = (q0, q0 + len(q)) if q0 >= 0 else (0, len(low))
+
+    def pos(k, n):
+        return [start + j for j, (a, b) in enumerate(spans) if a < k + n and b > k]
+
+    obj = []
+    for name in names:
         hit = []
-        for cand in (o.lower(), o.lower().split()[-1]):
-            k = low.find(cand, max(q0, 0), (q0 + len(q)) if q0 >= 0 else None)
+        for cand in (name.lower(), name.lower().split()[-1]):
+            k = low.find(cand, lo, hi)
             if k >= 0:
-                hit = _positions_in(spans, start, k, len(cand))
+                hit = pos(k, len(cand))
                 break
-        obj_spans.append(hit or find_word_positions(tokenizer, input_ids, o, start))
-    return q_pos, obj_spans
+        obj.append(hit)
+    return (pos(q0, len(q)) if q0 >= 0 else []), obj
 
 
 def letter_token_ids(tokenizer, n: int) -> list[int]:
     return [tokenizer.encode(LETTERS[i], add_special_tokens=False)[0] for i in range(n)]
 
 
-def prepare(model, processor, sample: Sample, max_pixels: int = 1024 * 32 * 32,
-            min_pixels: int = 256 * 32 * 32, image: Image.Image | None = None) -> Prepared:
-    orig = image if image is not None else Image.open(sample.image_path).convert("RGB")
-    img = resize_to_budget(orig, max_pixels, min_pixels, token_factor(model))
-    inputs, spans = build_inputs(model, processor, [img], build_prompt(sample))
-    sp = spans[0]
-    gh, gw = sp.grid_h, sp.grid_w
-
-    W, H = orig.size
-    tok = processor.tokenizer
-    id_list = inputs["input_ids"][0].tolist()
-    after_img = int(sp.pos[-1]) + 1
-    q_pos, obj_spans = locate_question(tok, id_list, sample.question, sample.target_objects, after_img)
-    boxes = sample.bboxes
-    per_obj = [bbox_coverage_grid([b], W, H, gh, gw) for b in boxes] if len(boxes) == len(sample.target_objects) else []
-    dcov = None
-    if sample.meta.get("distractor_bboxes"):
-        dcov = bbox_coverage_grid(sample.meta["distractor_bboxes"], W, H, gh, gw)
-    return Prepared(
-        sample=sample, inputs=inputs, image=img, grid_h=gh, grid_w=gw, image_pos=sp.pos,
-        answer_pos=len(id_list) - 1, coverage=bbox_coverage_grid(boxes, W, H, gh, gw),
-        object_pos={o: s for o, s in zip(sample.target_objects, obj_spans)},
-        letter_ids=letter_token_ids(tok, len(sample.options)), distractor_coverage=dcov,
-        question_pos=q_pos, object_spans=obj_spans, object_cov=per_obj, spans=spans,
-    )
+def prepare(model, processor, sample: Sample, max_pixels: int, min_pixels: int = 64 * 32 * 32,
+            image: Image.Image | None = None, prefix: str = "", extra_images=()) -> Prepared:
+    """image: main image to use instead of the file (e.g. with a drawn box); extra_images are
+    appended after it as-is (already resized), e.g. a zoomed crop."""
+    img = image if image is not None else Image.open(sample.image_path).convert("RGB")
+    img = resize_to_budget(img, max_pixels, min_pixels, token_factor(model))
+    inputs, spans = build_inputs(model, processor, [img, *extra_images], build_prompt(sample, prefix))
+    ids = inputs["input_ids"][0].tolist()
+    q_pos, obj_pos = locate_question(processor.tokenizer, ids, sample.question, [o.name for o in sample.objects],
+                                     int(spans[-1].pos[-1]) + 1)
+    return Prepared(sample, inputs, img, spans, len(ids) - 1, letter_token_ids(processor.tokenizer, len(sample.options)),
+                    q_pos, obj_pos)
 
 
 @torch.no_grad()
-def forward(model, prep: Prepared, position_ids: torch.Tensor | None = None, **kw):
-    return model(**prep.inputs, position_ids=position_ids, use_cache=False, logits_to_keep=1, **kw)
+def forward(model, prep_or_inputs, position_ids: torch.Tensor | None = None, **kw):
+    inputs = prep_or_inputs.inputs if isinstance(prep_or_inputs, Prepared) else prep_or_inputs
+    return model(**inputs, position_ids=position_ids, use_cache=False, logits_to_keep=1, **kw)
 
 
 def answer_from_logits(logits: torch.Tensor, prep: Prepared) -> dict:
     """Multiple-choice prediction restricted to the option letters."""
-    lg = logits[0, -1].float()[prep.letter_ids]
-    p = torch.softmax(lg, -1)
-    pred = int(p.argmax())
-    return {"pred": pred, "correct": pred == prep.sample.answer_idx, "probs": p.tolist(),
-            "p_correct": float(p[prep.sample.answer_idx])}
+    lp = logits[0, -1].float()[prep.letter_ids].log_softmax(-1)
+    pred = int(lp.argmax())
+    return {"pred": pred, "correct": pred == prep.sample.answer_idx, "probs": lp.exp().tolist(),
+            "logp_correct": float(lp[prep.sample.answer_idx])}
+
+
+def rope_positions(model, inputs) -> torch.Tensor:
+    pos, _ = model.model.get_rope_index(inputs["input_ids"], inputs["image_grid_thw"], None, inputs.get("attention_mask"))
+    return pos
+
+
+@torch.no_grad()
+def greedy_generate(model, processor, inputs, max_new_tokens: int = 64, position_ids: torch.Tensor | None = None) -> str:
+    """Greedy decoding with an explicit KV-cache loop, so edited MRoPE positions (and any active hooks)
+    apply to the prompt; generated text tokens continue at last prompt position + 1."""
+    pos = position_ids if position_ids is not None else rope_positions(model, inputs)
+    out = model(**inputs, position_ids=pos, use_cache=True, logits_to_keep=1)
+    past, nxt = out.past_key_values, out.logits[0, -1].argmax()
+    eos = model.generation_config.eos_token_id
+    eos = set(eos if isinstance(eos, (list, tuple)) else [eos]) | {processor.tokenizer.eos_token_id}
+    last = pos[0, 0, -1]
+    toks = []
+    for i in range(max_new_tokens):
+        if int(nxt) in eos:
+            break
+        toks.append(int(nxt))
+        p = (last + 1 + i).to(pos.dtype).view(1, 1, 1).expand(3, 1, 1)
+        out = model(input_ids=nxt.view(1, 1), past_key_values=past, position_ids=p, use_cache=True)
+        past, nxt = out.past_key_values, out.logits[0, -1].argmax()
+    return processor.tokenizer.decode(toks, skip_special_tokens=True)

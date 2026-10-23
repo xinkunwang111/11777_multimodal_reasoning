@@ -1,28 +1,26 @@
 #!/usr/bin/env bash
-# One-click runner for every RQ1 experiment, followed by an aggregated report.
+# One-click runner: probes 1-3 and the method on V* and the synthetic binding set, then REPORT.md.
 #
-#   bash run_all.sh                         # everything, default settings
-#   QUICK=1 bash run_all.sh                 # dry run: 20 samples per dataset, small synthetic set
-#   STEPS="bench zoom report" bash run_all.sh
-#   MODEL=Qwen/Qwen3-VL-4B-Instruct OUT=outputs/4b bash run_all.sh
-#   SWEEP_TOKENS="256 4096" bash run_all.sh # also re-run bench + zoom at other token budgets
+#   bash run_all.sh                          # everything
+#   QUICK=1 bash run_all.sh                  # dry run: 20 questions per dataset, small synthetic set
+#   STEPS="p1 method report" bash run_all.sh # only some steps
+#   MODEL=Qwen/Qwen3-VL-4B-Instruct bash run_all.sh
 #
-# Steps (in order; `probes` = attention logit_lens linear_probe interventions):
-#   data          generate the synthetic set, download V* if missing
-#   attention     01 attention heatmaps                 (V* and synthetic)
-#   logit_lens    02 logit lens on image tokens         (V* and synthetic)
-#   linear_probe  03 linear probes                      (V* and synthetic)
-#   interventions 04 region / DeepStack / MRoPE ablations (V* and synthetic)
-#   bench         05 grounding bench: calibrate on synthetic, test on V*; synthetic with a 30/70 split
-#   zoom          06 self-grounded zoom (needs bench)
-#   sweep         05 eval + 06 at each budget in SWEEP_TOKENS
-#   report        collect everything into $OUT/REPORT.md
+# Steps, per dataset (V* and synthetic), in dependency order:
+#   data      generate the synthetic set; download V* if missing
+#   p1        probe 1 - does the model find the object (explicit box / attention)?  -> grounding heads, threshold
+#   p2        probe 2 - in which layers is the object read (attention knockout)?    -> reading layers
+#   p3        probe 3 - what DeepStack and MRoPE contribute to finding vs reading    (uses p1)
+#   method    self-grounded attention steering vs text / draw / crop                 (uses p1, p2)
+#   appendix  logit lens + linear probes (off by default: STEPS="... appendix ...")
+#   report    $OUT/REPORT.md
+# Calibration (grounding heads, thresholds, steer layers / strength) always uses a held-out split:
+# CALIB_FRAC of each dataset by default, or the synthetic set for V* with CALIB_FROM_SYNTH=1.
 #
-# A finished step leaves $dir/.done and is skipped next time (FORCE=1 re-runs it), so an
-# interrupted run can simply be restarted. Steps can also be spread over GPUs, e.g.
-#   CUDA_VISIBLE_DEVICES=0 STEPS="data probes" bash run_all.sh &
-#   CUDA_VISIBLE_DEVICES=1 STEPS="bench zoom" bash run_all.sh &
-# (run `data` first, or in the same job as the steps that need it).
+# A finished step leaves <dir>/.done and is skipped next time (FORCE=1 re-runs), so a crashed or
+# interrupted run is resumed by running the same command again. Logs: $OUT/logs/<step>.log.
+# Several GPUs: run p1 first, then e.g.
+#   CUDA_VISIBLE_DEVICES=0 STEPS="p2 method" bash run_all.sh &  CUDA_VISIBLE_DEVICES=1 STEPS="p3" bash run_all.sh
 # If huggingface.co is unreachable: export HF_ENDPOINT=https://hf-mirror.com
 
 set -uo pipefail
@@ -30,46 +28,38 @@ cd "$(dirname "$0")"
 
 MODEL=${MODEL:-Qwen/Qwen3-VL-8B-Instruct}
 DTYPE=${DTYPE:-bfloat16}
-DATASET=${DATASET:-vstar}            # main benchmark: vstar | synthetic | path/to/samples.jsonl
-DATA_ROOT=${DATA_ROOT:-data/vstar}
+VSTAR_ROOT=${VSTAR_ROOT:-data/vstar}
 SYNTH_ROOT=${SYNTH_ROOT:-data/synthetic}
-SYNTH_N=${SYNTH_N:-300}              # synthetic images (x3 questions: attr, swapped twin, relation)
+SYNTH_N=${SYNTH_N:-300}               # synthetic images (each -> 2 colour-twin attribute questions + 1 relation)
+DATASETS=${DATASETS:-"vstar synthetic"}
 OUT=${OUT:-outputs/$(basename "$MODEL")}
-MAX_PIXELS=${MAX_PIXELS:-1048576}    # 1024 visual tokens (32x32 px each)
-MIN_PIXELS=${MIN_PIXELS:-262144}
-CROP_PIXELS=${CROP_PIXELS:-1048576}
-CALIB_LIMIT=${CALIB_LIMIT:-150}      # synthetic samples used to calibrate heads / thresholds for V*
+MAX_PIXELS=${MAX_PIXELS:-1048576}     # 1024 visual tokens (32x32 px each)
+CROP_PIXELS=${CROP_PIXELS:-262144}    # 256 extra tokens for the zoomed crop baseline
+CALIB_FRAC=${CALIB_FRAC:-0.3}
+CALIB_FROM_SYNTH=${CALIB_FROM_SYNTH:-0}
+P2_GROUPS=${P2_GROUPS:-"all last"}
 LIMIT=${LIMIT:-}
-GRAD=${GRAD:-1}                      # also evaluate gradient x input maps (one backward pass per sample)
-SWEEP_TOKENS=${SWEEP_TOKENS:-}
-STEPS=${STEPS:-"data probes bench zoom sweep report"}
+STEPS=${STEPS:-"data p1 p2 p3 method report"}
 QUICK=${QUICK:-0}
 FORCE=${FORCE:-0}
-KEEP_GOING=${KEEP_GOING:-1}          # 0: stop at the first failing step
-VERBOSE=${VERBOSE:-0}                # 1: also stream each step's output to the terminal
+KEEP_GOING=${KEEP_GOING:-1}
+VERBOSE=${VERBOSE:-0}
 PY=${PYTHON:-python}
 
 if [[ $QUICK == 1 ]]; then
-  LIMIT=${LIMIT:-20}; SYNTH_N=30; CALIB_LIMIT=30
+  LIMIT=${LIMIT:-20}; SYNTH_N=20; P2_GROUPS="all"
   [[ $OUT == outputs/* ]] && OUT=${OUT}_quick
 fi
-
-STEPS=${STEPS//probes/attention logit_lens linear_probe interventions}
 want() { [[ " $STEPS " == *" $1 "* ]]; }
 
-MAIN=$(basename "$DATASET" .jsonl)
-DATASETS=("$MAIN")
-[[ $DATASET != synthetic ]] && DATASETS+=("synthetic")
-
-ds_args() {  # common data/model arguments for dataset name $1
-  local a=(--model "$MODEL" --dtype "$DTYPE" --min_pixels "$MIN_PIXELS")
-  if [[ $1 == synthetic ]]; then a+=(--dataset synthetic --data_root "$SYNTH_ROOT")
-  else a+=(--dataset "$DATASET" --data_root "$DATA_ROOT"); fi
-  [[ -n $LIMIT ]] && a+=(--limit "$LIMIT")
-  printf '%s\n' "${a[@]}"
-}
-
 mkdir -p "$OUT/logs"
+cat > "$OUT/logs/run_config.txt" <<EOF
+started $(date '+%F %T') on $(hostname)
+MODEL=$MODEL DTYPE=$DTYPE DATASETS=$DATASETS VSTAR_ROOT=$VSTAR_ROOT SYNTH_ROOT=$SYNTH_ROOT SYNTH_N=$SYNTH_N
+MAX_PIXELS=$MAX_PIXELS CROP_PIXELS=$CROP_PIXELS LIMIT=${LIMIT:-all} CALIB_FRAC=$CALIB_FRAC CALIB_FROM_SYNTH=$CALIB_FROM_SYNTH
+P2_GROUPS=$P2_GROUPS STEPS=$STEPS
+EOF
+
 FAILED=()
 run() {  # run <name> <out dir> <command...>
   local name=$1 dir=$2; shift 2
@@ -85,86 +75,61 @@ run() {  # run <name> <out dir> <command...>
     FAILED+=("$name"); [[ $KEEP_GOING == 1 ]] || { echo "stopping (KEEP_GOING=0)"; exit 1; }
   fi
 }
+needs() {  # needs <file> <step name>: dependency check
+  [[ -f $1 ]] && return 0
+  echo "[skip] $2: missing $1 (run its prerequisite step first)"; FAILED+=("$2"); return 1
+}
 
-echo "model=$MODEL dataset=$DATASET out=$OUT limit=${LIMIT:-all} budget=$MAX_PIXELS px steps: $STEPS"
-cat > "$OUT/logs/run_config.txt" <<EOF
-started $(date '+%F %T') on $(hostname)
-MODEL=$MODEL DTYPE=$DTYPE DATASET=$DATASET DATA_ROOT=$DATA_ROOT SYNTH_ROOT=$SYNTH_ROOT SYNTH_N=$SYNTH_N
-MAX_PIXELS=$MAX_PIXELS MIN_PIXELS=$MIN_PIXELS CROP_PIXELS=$CROP_PIXELS LIMIT=${LIMIT:-all} CALIB_LIMIT=$CALIB_LIMIT
-GRAD=$GRAD SWEEP_TOKENS=${SWEEP_TOKENS:-none} STEPS=$STEPS
-EOF
+data_args() {  # model + data arguments for dataset $1
+  local a=(--model "$MODEL" --dtype "$DTYPE" --max_pixels "$MAX_PIXELS")
+  if [[ $1 == synthetic ]]; then a+=(--dataset synthetic --data_root "$SYNTH_ROOT"); else a+=(--dataset "$1" --data_root "$VSTAR_ROOT"); fi
+  [[ -n $LIMIT ]] && a+=(--limit "$LIMIT")
+  printf '%s\n' "${a[@]}"
+}
+split_args() {  # calibration split for dataset $1
+  if [[ $1 != synthetic && $CALIB_FROM_SYNTH == 1 ]]; then
+    printf '%s\n' --calib_dataset synthetic --calib_root "$SYNTH_ROOT" --calib_limit "${LIMIT:-150}"
+  else
+    printf '%s\n' --calib_frac "$CALIB_FRAC"
+  fi
+}
 
-# ---------------------------------------------------------------- data
+echo "model=$MODEL datasets=[$DATASETS] out=$OUT limit=${LIMIT:-all} steps: $STEPS"
+
 if want data; then
   if [[ ! -f $SYNTH_ROOT/samples.jsonl || $FORCE == 1 ]]; then
-    run make_synthetic "$SYNTH_ROOT" $PY scripts/00_make_synthetic.py --out "$SYNTH_ROOT" --n_images "$SYNTH_N"
+    run make_synthetic "$SYNTH_ROOT" $PY scripts/make_synthetic.py --out "$SYNTH_ROOT" --n_images "$SYNTH_N"
   else echo "[skip] make_synthetic ($SYNTH_ROOT exists)"; fi
-  if [[ $DATASET == vstar && ! -d $DATA_ROOT/direct_attributes ]]; then
-    run download_vstar "$DATA_ROOT" $PY -c "from rq1grounding.data import load_vstar; print(len(load_vstar('$DATA_ROOT')), 'V* samples')"
+  if [[ " $DATASETS " == *" vstar "* && ! -d $VSTAR_ROOT/direct_attributes ]]; then
+    run download_vstar "$VSTAR_ROOT" $PY -c "from rq1grounding.data import load_vstar; print(len(load_vstar('$VSTAR_ROOT')), 'V* questions')"
   fi
 fi
 
-# ---------------------------------------------------------------- probes 01-04
-for ds in "${DATASETS[@]}"; do
-  mapfile -t A < <(ds_args "$ds")
+for dsarg in $DATASETS; do  # vstar | synthetic | path/to/samples.jsonl
+  ds=$(basename "$dsarg" .jsonl)
   D=$OUT/$ds
-  want attention && run "${ds}_01_attention" "$D/01_attention" \
-    $PY scripts/01_attention_grounding.py "${A[@]}" --max_pixels "$MAX_PIXELS" --out "$D/01_attention"
-  want logit_lens && run "${ds}_02_logit_lens" "$D/02_logit_lens" \
-    $PY scripts/02_logit_lens.py "${A[@]}" --max_pixels "$MAX_PIXELS" --out "$D/02_logit_lens"
-  want linear_probe && run "${ds}_03_linear_probe" "$D/03_linear_probe" \
-    $PY scripts/03_linear_probe.py "${A[@]}" --max_pixels "$MAX_PIXELS" --out "$D/03_linear_probe"
-  want interventions && run "${ds}_04_interventions" "$D/04_interventions" \
-    $PY scripts/04_interventions.py "${A[@]}" --max_pixels "$MAX_PIXELS" --attention --out "$D/04_interventions"
+  mapfile -t A < <(data_args "$dsarg")
+  mapfile -t SPL < <(split_args "$dsarg")
+  # shellcheck disable=SC2086
+  want p1 && run "${ds}_p1_find" "$D/p1_find" $PY scripts/probe1_find.py "${A[@]}" "${SPL[@]}" --out "$D/p1_find"
+  # shellcheck disable=SC2086
+  want p2 && run "${ds}_p2_read" "$D/p2_read" $PY scripts/probe2_read.py "${A[@]}" --groups $P2_GROUPS --out "$D/p2_read"
+  if want p3 && needs "$D/p1_find/config.json" "${ds}_p3_design"; then
+    run "${ds}_p3_design" "$D/p3_design" $PY scripts/probe3_design.py "${A[@]}" --p1 "$D/p1_find" --out "$D/p3_design"
+  fi
+  if want method && needs "$D/p1_find/config.json" "${ds}_method"; then
+    [[ -f $D/p2_read/per_sample.jsonl ]] || echo "[warn] ${ds}_method: no probe-2 results, steering falls back to middle layers"
+    run "${ds}_method" "$D/method" $PY scripts/method_steer.py "${A[@]}" "${SPL[@]}" --p1 "$D/p1_find" --p2 "$D/p2_read" \
+      --crop_pixels "$CROP_PIXELS" --out "$D/method"
+  fi
+  if want appendix; then
+    run "${ds}_appendix_logit_lens" "$D/appendix_logit_lens" $PY scripts/appendix/logit_lens.py "${A[@]}" --out "$D/appendix_logit_lens"
+    run "${ds}_appendix_linear_probe" "$D/appendix_linear_probe" $PY scripts/appendix/linear_probe.py "${A[@]}" --out "$D/appendix_linear_probe"
+  fi
 done
 
-# ---------------------------------------------------------------- bench 05
-G=(); [[ $GRAD == 1 ]] && G=(--grad)
-bench_args() {  # how dataset $1 is calibrated
-  if [[ $1 == synthetic ]]; then echo "--calib_frac 0.3"
-  else echo "--calib_dataset synthetic --calib_root $SYNTH_ROOT --calib_limit $CALIB_LIMIT"; fi
-}
-if want bench; then
-  for ds in "${DATASETS[@]}"; do
-    mapfile -t A < <(ds_args "$ds")
-    # shellcheck disable=SC2046
-    run "${ds}_05_bench" "$OUT/$ds/05_bench" \
-      $PY scripts/05_grounding_bench.py "${A[@]}" --max_pixels "$MAX_PIXELS" --mode both $(bench_args "$ds") "${G[@]}" \
-      --out "$OUT/$ds/05_bench"
-  done
-fi
-
-# ---------------------------------------------------------------- zoom 06
-zoom() {  # zoom <dataset> <config> <out> <max_pixels>
-  local ds=$1 cfg=$2 out=$3 px=$4
-  if [[ ! -f $cfg ]]; then echo "[skip] ${ds} zoom: $cfg missing (run the bench step first)"; FAILED+=("${ds}_06_zoom"); return; fi
-  mapfile -t A < <(ds_args "$ds")
-  run "${ds}_06_zoom$5" "$out" $PY scripts/06_self_grounded_zoom.py "${A[@]}" --max_pixels "$px" \
-    --crop_pixels "$CROP_PIXELS" --config "$cfg" "${G[@]}" --out "$out"
-}
-if want zoom; then
-  for ds in "${DATASETS[@]}"; do
-    zoom "$ds" "$OUT/$ds/05_bench/grounding_config.json" "$OUT/$ds/06_zoom" "$MAX_PIXELS" ""
-  done
-fi
-
-# ---------------------------------------------------------------- resolution sweep
-if want sweep && [[ -n $SWEEP_TOKENS ]]; then
-  for T in $SWEEP_TOKENS; do
-    px=$((T * 1024)); S=$OUT/$MAIN/sweep_${T}tok; cfg=$OUT/$MAIN/05_bench/grounding_config.json
-    mapfile -t A < <(ds_args "$MAIN")
-    if [[ -f $cfg ]]; then
-      run "${MAIN}_sweep_${T}_bench" "$S/05_bench" $PY scripts/05_grounding_bench.py "${A[@]}" --max_pixels "$px" \
-        --mode eval --config "$cfg" "${G[@]}" --out "$S/05_bench"
-    fi
-    zoom "$MAIN" "$cfg" "$S/06_zoom" "$px" "_sweep_${T}"
-  done
-fi
-
-# ---------------------------------------------------------------- report
 if want report; then
   $PY scripts/collect_results.py "$OUT" && echo "[ ok ] report -> $OUT/REPORT.md"
 fi
-
 if (( ${#FAILED[@]} )); then echo "finished with failures: ${FAILED[*]}"; exit 1; fi
 echo "all done -> $OUT"

@@ -1,4 +1,4 @@
-"""Probe 2 - What do the visual tokens *at the object* say?  Logit lens on image tokens.
+"""Appendix A - Is the attribute readable at the object's visual tokens?  Logit lens on image tokens.
 
 Each image token's residual state at every LLM layer is decoded with the final
 norm + LM head. Comparing tokens inside the GT box with an equal number of
@@ -19,8 +19,8 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from rq1grounding.cli import common_parser, setup, to_jsonable  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+from rq1grounding.cli import common_parser, load_samples, setup, to_jsonable  # noqa: E402
 from rq1grounding.data import option_keywords  # noqa: E402
 from rq1grounding.hooks import HiddenStateRecorder, logit_lens  # noqa: E402
 from rq1grounding.model import answer_from_logits, forward, prepare  # noqa: E402
@@ -40,9 +40,9 @@ def main():
     p = common_parser(__doc__)
     p.add_argument("--max_tokens", type=int, default=96, help="max in-box (and out-box) tokens decoded per image")
     p.add_argument("--n_top", type=int, default=20, help="samples for which top decoded words are dumped")
-    p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
-    model, processor, samples = setup(args)
+    samples = load_samples(args)
+    model, processor = setup(args)
     tok = processor.tokenizer
     rng = np.random.default_rng(args.seed)
 
@@ -50,7 +50,7 @@ def main():
     recs, tops = [], []
     for si, s in enumerate(tqdm(samples)):
         prep = prepare(model, processor, s, args.max_pixels, args.min_pixels)
-        cov = prep.cov_flat
+        cov = prep.gt_cov()
         inb, outb = np.flatnonzero(cov > 0), np.flatnonzero(cov == 0)
         if len(inb) == 0 or len(outb) == 0:
             continue
@@ -63,7 +63,7 @@ def main():
         H = rec.stacked  # [Ly+1, n, D]
         n_in = len(inb)
 
-        obj_ids = sorted({i for o in s.target_objects for i in word_variants(tok, o.split()[-1])})
+        obj_ids = sorted({i for o in s.objects for i in word_variants(tok, o.name.split()[-1])})
         opt_ids = [word_variants(tok, w) for w in option_keywords(s.options)]
         row = {k: [] for k in A}
         top_layers = {}
@@ -86,7 +86,7 @@ def main():
         recs.append({"qid": s.qid, "category": s.category, **ans, "n_in": n_in})
         if top_layers:
             tops.append({"qid": s.qid, "question": s.question, "answer": s.options[s.answer_idx],
-                         "objects": s.target_objects, "in_box_top_tokens_by_layer": top_layers})
+                         "objects": [o.name for o in s.objects], "in_box_top_tokens_by_layer": top_layers})
 
     A = {k: np.array(v) for k, v in A.items()}
     np.savez_compressed(os.path.join(args.out, "arrays.npz"), **A)
