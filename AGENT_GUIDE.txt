@@ -187,12 +187,17 @@ RQ1 实验运行指南（交给执行 agent 使用）
        "attention on the object when the answer is correct: X; when it is wrong: Y"
      的 X 和 Y，以及 answer accuracy。
   4. 探查 2：reading window；delta_target 和 delta_control 两个值；share_target_hurts_more。
-  5. 方法：summary 表中以下几项的准确率：
+  5. 方法 A：summary 表中以下几项的准确率：
        base、base_hi、steer（attn 列）、crop（attn 列）、steer（gt 列）
      以及 by_found 表（注意力找到 / 没找到物体两组）。
-  6. 合成集部分（如果跑了）：同样报告第 3-5 项。
-  7. 如有失败过的步骤：写出步骤名、原因和处理方式。
-  8. rq1_results.tar.gz 的存放路径。
+  6. 方法 B（VEA）：报告中 "Method B - VEA" 部分的
+       - "layers [...]" 那一行：选中的层；
+       - "seeing but not believing" 那一行的全部数字；
+       - accuracy 表每一行（base、inst、vea、vea_no_prompt、vea_no_denoise、vea_no_smooth、
+         vea_no_profiling、vea_gt）的 accuracy、fixed、broken。
+  7. 合成集部分（如果跑了）：同样报告第 3-6 项。
+  8. 如有失败过的步骤：写出步骤名、原因和处理方式。
+  9. rq1_results.tar.gz 的存放路径。
 
 
 附：目录说明
@@ -201,6 +206,6 @@ RQ1 实验运行指南（交给执行 agent 使用）
   data/vstar/           V* 数据（direct_attributes/、relative_position/、test_questions.jsonl）
   data/synthetic/       合成绑定数据集
   outputs/<模型名>/     结果：REPORT.md、logs/、vstar/、synthetic/
-                        每个数据集目录下有 p1_attention/、p2_knockout/、method/
+                        每个数据集目录下有 p1_attention/、p2_knockout/、method/、vea/
   run_all.sh            一键运行脚本，变量说明见文件开头的注释
   docs/DESIGN.md        实验设计说明（执行时不需要阅读）
