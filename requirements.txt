@@ -6,6 +6,7 @@ huggingface_hub
 pillow
 numpy
 scikit-learn
+scipy
 matplotlib
 tqdm
 pytest
