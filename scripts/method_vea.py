@@ -41,7 +41,8 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from rq1grounding import vea as V  # noqa: E402
-from rq1grounding.cli import add_split_args, common_parser, load_samples, nanmean, setup, to_jsonable, write_csv, write_jsonl  # noqa: E402
+from rq1grounding.cli import (add_split_args, append_jsonl, common_parser, load_samples,
+                              nanmean, read_jsonl, setup, to_jsonable, write_csv, write_jsonl)  # noqa: E402
 from rq1grounding.data import LETTERS  # noqa: E402
 from rq1grounding.grounding import auroc_rows  # noqa: E402
 from rq1grounding.model import answer_from_logits, forward, prepare, token_factor  # noqa: E402
@@ -191,14 +192,21 @@ def main():
     spans = {"L0-50%": V.layer_span(n_layers, 0, 0.5), "L50-100%": V.layer_span(n_layers, 0.5, 1),
              "L0-100%": list(range(n_layers))}
 
+    out_file = os.path.join(args.out, "per_sample.jsonl")
+    done_recs = read_jsonl(out_file)
+    done_map = {r["qid"]: r for r in done_recs if "variants" in r}
     recs = []
     os.makedirs(os.path.join(args.out, "vis"), exist_ok=True)
     for i, s in enumerate(tqdm(test, desc="test")):
+        if s.qid in done_map:
+            recs.append(done_map[s.qid])
+            continue
         rec, prep, maps, images = run_question(model, processor, s, prof["layers"], spans, args, cell)
         recs.append(rec)
+        append_jsonl(out_file, rec)
         if i < args.n_vis and "vea" in maps:
             visualize(prep, rec, maps, images, os.path.join(args.out, "vis", f"{i:04d}_{s.qid.replace('/', '_')}.png"))
-    write_jsonl(os.path.join(args.out, "per_sample.jsonl"), recs)
+    write_jsonl(out_file, recs)
 
     table, attribution, snb, by_found = summarize(recs, args.variants, n_layers)
     write_csv(os.path.join(args.out, "summary.csv"), table)

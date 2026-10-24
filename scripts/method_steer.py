@@ -34,8 +34,8 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from rq1grounding import geometry as G  # noqa: E402
 from rq1grounding.attention import AttentionScaler  # noqa: E402
-from rq1grounding.cli import (add_split_args, common_parser, load_p1_config, load_samples, nanmean, reading_layers,  # noqa: E402
-                              setup, to_jsonable, write_csv, write_jsonl)
+from rq1grounding.cli import (add_split_args, append_jsonl, common_parser, load_p1_config, load_samples,
+                              nanmean, read_jsonl, reading_layers, setup, to_jsonable, write_csv, write_jsonl)
 from rq1grounding.cues import MODES, crop_cue, draw_cue, steer_edit, text_cue  # noqa: E402
 from rq1grounding.grounding import aggregate, map_metrics, map_to_box, record_attention  # noqa: E402
 from rq1grounding.model import answer_from_logits, forward, prepare  # noqa: E402
@@ -142,8 +142,14 @@ def main():
         print(f"steer: layers {steer['layer_set']} {steer['layers']}, {args.steer_mode} {steer['value']}")
 
     budget = args.max_pixels + args.crop_pixels
+    out_file = os.path.join(args.out, "per_sample.jsonl")
+    done_rows = read_jsonl(out_file)
+    done_map = {r["qid"]: r for r in done_rows if "results" in r}
     rows = []
     for s in tqdm(test, desc="test"):
+        if s.qid in done_map:
+            rows.append(done_map[s.qid])
+            continue
         orig = Image.open(s.image_path).convert("RGB")
         prep = prepare(model, processor, s, args.max_pixels, args.min_pixels, image=orig)
         ap = attention_pass(model, prep, cfg)
@@ -155,9 +161,11 @@ def main():
             for mode in args.modes:
                 r = run_mode(model, processor, prep, orig, mode, regions[src], steer, args)
                 res[f"{mode}|{src}"] = r if r is not None else {**res["base"], "no_region": True}
-        rows.append({"qid": s.qid, "category": s.category, "results": res, "regions": {k: regions[k] for k in args.sources},
-                     "region_quality": quality, "attn_found": ap["found"]})
-    write_jsonl(os.path.join(args.out, "per_sample.jsonl"), rows)
+        row = {"qid": s.qid, "category": s.category, "results": res, "regions": {k: regions[k] for k in args.sources},
+               "region_quality": quality, "attn_found": ap["found"]}
+        rows.append(row)
+        append_jsonl(out_file, row)
+    write_jsonl(out_file, rows)
 
     def acc(key, rs):
         return nanmean([r["results"][key]["correct"] for r in rs if key in r["results"]])

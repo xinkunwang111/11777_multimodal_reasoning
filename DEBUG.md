@@ -83,7 +83,30 @@ TypeError: can't convert cuda:0 device type tensor to numpy. Use Tensor.cpu() to
 
 1. **Unit Tests**:
    Ran `pytest -q tests`:
-   `17 passed in 144.63s` (100% pass, 0 failures).
+   `21 passed in 202.80s` (100% pass, 0 failures, including VEA tests).
 2. **Setup Check**:
-   Re-evaluated through SLURM GPU job.
+   Re-evaluated through SLURM GPU job (`check_setup.py` passed).
+
+---
+
+# Feature & Robustness Update: Real-Time Incremental Writing & Resuming
+
+## 1. Motivation
+
+In long-running GPU evaluations (especially on slower architectures or large datasets, e.g., probe2 knockout requiring 28 forward passes per question), tasks may face SLURM walltime limits or cluster preemption.
+Originally, evaluation scripts (`probe1_attention.py`, `probe2_knockout.py`, `method_steer.py`, `method_vea.py`) accumulated results entirely in memory and only called `write_jsonl` after the full sample loop finished. If a job timed out before the last question, all prior hours of computation were lost.
+
+## 2. Implementation
+
+1. **`rq1grounding/cli.py`**:
+   - Added `append_jsonl(path, row)` helper with automated parent directory creation and immediate `flush()`.
+2. **`scripts/probe2_knockout.py`**:
+   - Reads existing lines from `per_sample.jsonl` upon startup.
+   - Builds `done_map = {r["qid"]: r for r in done_rows if "knockout" in r and r.get("knockout")}`.
+   - For already completed questions, immediately reuses the record.
+   - For newly processed questions, appends each sample to `per_sample.jsonl` immediately upon completion.
+   - Re-writes clean final `per_sample.jsonl` and computes `summary.json` at loop conclusion.
+3. **`scripts/probe1_attention.py`, `scripts/method_steer.py`, `scripts/method_vea.py`**:
+   - Applied identical incremental appending and resuming pattern via `append_jsonl` and `read_jsonl`.
+
 

@@ -30,7 +30,8 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from rq1grounding import geometry as G  # noqa: E402
 from rq1grounding.attention import AttentionScaler, AttnEdit  # noqa: E402
-from rq1grounding.cli import common_parser, load_samples, nanmean, reading_layers, setup, to_jsonable, write_jsonl  # noqa: E402
+from rq1grounding.cli import (append_jsonl, common_parser, load_samples, nanmean,
+                              read_jsonl, reading_layers, setup, to_jsonable, write_jsonl)  # noqa: E402
 from rq1grounding.model import answer_from_logits, forward, prepare  # noqa: E402
 from rq1grounding.viz import layer_curves  # noqa: E402
 
@@ -65,8 +66,14 @@ def main():
     windows = layer_windows(model.config.text_config.num_hidden_layers, args.window, args.stride)
     rng = np.random.default_rng(args.seed)
 
+    out_file = os.path.join(args.out, "per_sample.jsonl")
+    done_rows = read_jsonl(out_file)
+    done_map = {r["qid"]: r for r in done_rows if "knockout" in r and r.get("knockout")}
     rows = []
     for s in tqdm(samples):
+        if s.qid in done_map:
+            rows.append(done_map[s.qid])
+            continue
         prep = prepare(model, processor, s, args.max_pixels, args.min_pixels)
         base = answer_from_logits(forward(model, prep).logits, prep)
         img = prep.image_pos.cpu().numpy()
@@ -92,7 +99,8 @@ def main():
                 out.append(cell)
             row["knockout"][g] = out
         rows.append(row)
-    write_jsonl(os.path.join(args.out, "per_sample.jsonl"), rows)
+        append_jsonl(out_file, row)
+    write_jsonl(out_file, rows)
 
     centers = [float(np.mean(w)) for w in windows]
     summary = {"n": len(rows), "windows": windows, "mode": args.mode, "groups": {}}

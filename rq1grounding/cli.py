@@ -70,9 +70,21 @@ def to_jsonable(x):
 
 
 def write_jsonl(path, rows):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(path, "w") as f:
         for r in rows:
             f.write(json.dumps(to_jsonable(r)) + "\n")
+
+
+def append_jsonl(path, row):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(to_jsonable(row)) + "\n")
+        f.flush()
 
 
 def write_csv(path, rows):

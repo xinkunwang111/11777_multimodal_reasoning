@@ -27,7 +27,8 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from rq1grounding import geometry as G  # noqa: E402
-from rq1grounding.cli import add_split_args, common_parser, load_samples, nanmean, setup, to_jsonable, write_jsonl  # noqa: E402
+from rq1grounding.cli import (add_split_args, append_jsonl, common_parser, load_samples,
+                              nanmean, read_jsonl, setup, to_jsonable, write_jsonl)  # noqa: E402
 from rq1grounding.data import LETTERS  # noqa: E402
 from rq1grounding.grounding import (THRESHOLDS, aggregate, head_scores, map_metrics, map_to_box,  # noqa: E402
                                     record_attention, select_heads)
@@ -168,14 +169,21 @@ def main():
                      os.path.join(args.out, "threshold.png"), "map -> region threshold (calibration)", x=THRESHOLDS,
                      xlabel="t (x peak)")
 
+    out_file = os.path.join(args.out, "per_sample.jsonl")
+    done_recs = read_jsonl(out_file)
+    done_map = {r["qid"]: r for r in done_recs if "layers" in r}
     recs = []
     os.makedirs(os.path.join(args.out, "vis"), exist_ok=True)
     for i, s in enumerate(tqdm(test, desc="test")):
+        if s.qid in done_map:
+            recs.append(done_map[s.qid])
+            continue
         rec, prep, am, _ = analyse(model, processor, s, args, cfg["heads"], cfg["box_threshold"])
         recs.append(rec)
+        append_jsonl(out_file, rec)
         if i < args.n_vis:
             visualize(prep, rec, am, cfg, os.path.join(args.out, "vis", f"{i:04d}_{s.qid.replace('/', '_')}.png"))
-    write_jsonl(os.path.join(args.out, "per_sample.jsonl"), recs)
+    write_jsonl(out_file, recs)
 
     summary = summarize(recs)
     json.dump(to_jsonable(summary), open(os.path.join(args.out, "summary.json"), "w"), indent=2)
