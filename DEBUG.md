@@ -109,4 +109,24 @@ Originally, evaluation scripts (`probe1_attention.py`, `probe2_knockout.py`, `me
 3. **`scripts/probe1_attention.py`, `scripts/method_steer.py`, `scripts/method_vea.py`**:
    - Applied identical incremental appending and resuming pattern via `append_jsonl` and `read_jsonl`.
 
+---
+
+# Architecture & Precision Adaptation: V100 Tensor Cores via Float16
+
+## 1. Motivation
+
+NVIDIA Volta V100 (sm_70) lacks native hardware Tensor Core support for Bfloat16 (which was introduced in Ampere sm_80 and Hopper sm_90). In PyTorch, running Qwen3-VL-8B in `bfloat16` on V100 forces execution into software-emulated FP32 paths, reducing compute throughput to ~15 TFLOPS (~34s per forward pass with attention hooks).
+
+In contrast, V100 features 640 hardware Tensor Cores specifically designed for **`float16` (FP16)**, delivering **125 TFLOPS** (an 8x–10x acceleration over emulated BF16).
+
+## 2. Implementation & Configuration
+
+1. **Precision Switching**:
+   - Configured `DTYPE=float16` in the SLURM submission script [`run_v100.sbatch`](file:///jet/home/xwang93/11777/11777_multimodal_reasoning/run_v100.sbatch) and [`run_all.sh`](file:///jet/home/xwang93/11777/11777_multimodal_reasoning/run_all.sh).
+   - Validated that `AutoModelForImageTextToText.from_pretrained(..., dtype=torch.float16)` correctly instantiates weights in half-precision and drives V100 Tensor Cores.
+2. **Sample Limit**:
+   - Set `LIMIT=10` for the Quick Run test.
+   - For `vstar_p2_knockout`, the 10 completed samples are already safely saved on disk in `per_sample.jsonl`. It immediately generates `summary.json` and transitions to downstream methods (`method_steer`, `method_vea`, and synthetic evaluation) with 10x faster FP16 inference.
+
+
 
