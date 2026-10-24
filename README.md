@@ -98,7 +98,23 @@ python scripts/check_setup.py --model checkpoints/Qwen3-VL-8B-Instruct --data_ro
 
 ## 6. 运行实验
 
-### 6.1 一键运行（推荐）
+### 6.0 核心实验：注意力看得准不准，与答对率是否直接相关（一个脚本）
+
+```bash
+python scripts/attention_vs_accuracy.py --model checkpoints/Qwen3-VL-8B-Instruct --data_root data/vstar \
+    --dtype float16 --out outputs/attention_vs_accuracy      # V100 用 float16；A100 / H100 用 bfloat16
+```
+
+- 全部 191 道 V\* 题，每题一次前向（V100 上约 2 分钟，加上出图约 5 分钟）。不划分校准集，也不在答案上调任何参数。
+- **注意力**：问题中物体名 token 对图像的注意力，取所有 head 的平均，去掉 attention sink。只用定位最好的 25% 层；这些层只根据 GT 框挑选、不看答案，因此不会人为制造注意力与答对之间的关联。
+- **看准了**：注意力峰值落在物体的 GT 框里（关系题要求两个物体都命中）。另用 AUROC 衡量注意力集中在物体上的程度。
+- **结论怎么看**：
+  - `accuracy_vs_attention.png` 左图：看准 / 没看准两组的准确率（带 95% 置信区间和 Fisher 检验），按类别拆开；
+  - 右图：按 AUROC 三等分后的准确率；
+  - `summary.json` 里还有答对 / 答错两组的 AUROC 中位数和 Mann-Whitney 检验。
+- **可视化**：`gallery.png` 按"答对 / 答错 × 看准 / 没看准"每类各挑几例，每例四列：原图 + GT 框、注意力图、两者融合、物体附近放大；`+` 是注意力峰值。`vis/` 下每道题各有一张，文件名带上类别。
+
+### 6.1 一键运行（全部实验）
 
 ```bash
 export MODEL=checkpoints/Qwen3-VL-8B-Instruct
