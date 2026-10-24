@@ -68,23 +68,38 @@ def test_vstar_pipeline(mock):
     common = ["--model", mock / "tiny", "--dtype", "float32", "--dataset", "vstar", "--data_root", mock / "vstar",
               "--max_pixels", 120000]
     out = mock / "out"
+    D = out / "vstar"  # the layout run_all.sh writes and collect_results.py reads
     r = run("check_setup.py", "--model", mock / "tiny", "--dtype", "float32", "--dataset", "vstar",
             "--data_root", mock / "vstar", "--max_pixels", 120000)
     assert "OK - setup works" in r.stdout
-    run("probe1_attention.py", *common, "--calib_frac", 0.4, "--top_heads", 2, "--n_vis", 2, "--out", out / "p1")
-    run("probe2_knockout.py", *common, "--window", 2, "--stride", 2, "--out", out / "p2")
-    run("method_steer.py", *common, "--p1", out / "p1", "--p2", out / "p2", "--calib_frac", 0.4, "--lambdas", 0.5,
-        "--crop_pixels", 32768, "--out", out / "m")
-    run("appendix/qwen3vl_design.py", *common, "--p1", out / "p1", "--conditions", "baseline", "pos_hflip", "--out", out / "c")
-    rows = [json.loads(line) for line in open(out / "p1" / "per_sample.jsonl")]
+    run("probe1_attention.py", *common, "--calib_frac", 0.4, "--top_heads", 2, "--n_vis", 2, "--out", D / "p1_attention")
+    run("probe2_knockout.py", *common, "--window", 2, "--stride", 2, "--out", D / "p2_knockout")
+    run("method_steer.py", *common, "--p1", D / "p1_attention", "--p2", D / "p2_knockout", "--calib_frac", 0.4,
+        "--lambdas", 0.5, "--crop_pixels", 32768, "--out", D / "method")
+    run("method_vea.py", *common, "--calib_frac", 0.4, "--n_vis", 1, "--out", D / "vea")
+    run("appendix/qwen3vl_design.py", *common, "--p1", D / "p1_attention", "--conditions", "baseline", "pos_hflip",
+        "--out", D / "appendix_design")
+    rows = [json.loads(line) for line in open(D / "p1_attention" / "per_sample.jsonl")]
     assert rows and all(r["category"] in ("direct_attributes", "relative_position") for r in rows)
     rel = [r for r in rows if r["category"] == "relative_position"]
     assert all(len(r["objects"]) == 2 for r in rel)  # both GT objects of a relation question are scored
-    cfg = json.load(open(out / "p1" / "config.json"))
+    cfg = json.load(open(D / "p1_attention" / "config.json"))
     assert len(cfg["heads"]) == 2 and 0 < cfg["box_threshold"] < 1
     assert not set(cfg["calib_qids"]) & {r["qid"] for r in rows}  # calibration and test never overlap
-    m = list(open(out / "m" / "summary.csv"))
+    m = list(open(D / "method" / "summary.csv"))
     assert m[0].startswith("mode,attn,gt") and len(m) == 5  # header + base, base_hi, steer, crop
-    p2 = json.load(open(out / "p2" / "summary.json"))
+    p2 = json.load(open(D / "p2_knockout" / "summary.json"))
     assert set(p2["groups"]["all"]["used"]) == {"window", "delta_target", "delta_control", "share_target_hurts_more"}
+    v = json.load(open(D / "vea" / "summary.json"))
+    assert [t["method"] for t in v["table"]] == ["base", "inst", "vea", "vea_no_prompt", "vea_no_denoise", "vea_no_smooth",
+                                                "vea_no_profiling", "vea_gt"]
+    assert len(v["profile"]["layers"]) == 1 and len(v["profile"]["layer_auroc"]) == 4  # 10% of 4 layers, rounded up
+    assert not set(json.load(open(D / "vea" / "profile.json"))["calib_qids"]) & {r["qid"] for r in rows}
+    assert v["n"] == len(rows) and v["table"][0]["accuracy"] == pytest.approx(
+        json.load(open(D / "p1_attention" / "summary.json"))["accuracy"])  # same test split, same base answers
+    assert {a["scores"] for a in v["attribution"]} == {"L0-50%", "L50-100%", "L0-100%", "profiled + denoise"}
+    assert os.listdir(D / "vea" / "vis") and (D / "vea" / "layers_rapt.png").exists()
     run("collect_results.py", out)
+    report = open(out / "REPORT.md").read()
+    for section in ("Probe 1", "Probe 2", "Method A", "Method B - VEA", "DeepStack and MRoPE"):
+        assert section in report, section

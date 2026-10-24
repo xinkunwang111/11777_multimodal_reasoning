@@ -1,7 +1,7 @@
 """Pre-flight check before the real runs (about a minute on one GPU).
 
-Loads the model, answers a couple of questions, records the object-name attention and runs one attention
-knockout, printing what it sees. If this passes, every experiment script will run.
+Loads the model, answers a couple of questions, records the object-name attention, runs one attention
+knockout and one VEA highlight, printing what it sees. If this passes, every experiment script will run.
 
     python scripts/check_setup.py --model checkpoints/Qwen3-VL-8B-Instruct --data_root data/vstar
 """
@@ -17,7 +17,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from rq1grounding.attention import AttentionScaler, AttnEdit  # noqa: E402
 from rq1grounding.data import LETTERS, load_dataset  # noqa: E402
 from rq1grounding.grounding import aggregate, map_metrics, record_attention  # noqa: E402
-from rq1grounding.model import DEFAULT_MODEL, answer_from_logits, forward, load_model, prepare  # noqa: E402
+from rq1grounding.model import DEFAULT_MODEL, answer_from_logits, forward, load_model, prepare, token_factor  # noqa: E402
+from rq1grounding.vea import HINT, evidence_map, highlight, last_token_attention  # noqa: E402
 
 
 def main():
@@ -65,6 +66,13 @@ def main():
             ko = answer_from_logits(forward(model, prep).logits, prep)
         print(f"  knockout of the object in all layers: log p(correct) {ans['logp_correct']:.3f} -> {ko['logp_correct']:.3f}")
         assert np.isfinite(ko["logp_correct"])
+        attn, _ = last_token_attention(model, prep)
+        hl = highlight(prep.image, evidence_map(attn.mean(0), prep.grid_h, prep.grid_w, token_factor(model)))
+        p = prepare(model, processor, s, args.max_pixels, image=hl, prefix=HINT)
+        va = answer_from_logits(forward(model, p).logits, p)
+        print(f"  VEA (all layers): answer on the highlighted image ({LETTERS[va['pred']]}), "
+              f"log p(correct) {va['logp_correct']:.3f}")
+        assert p.n_img == prep.n_img and np.isfinite(va["logp_correct"])
     print("\nOK - setup works")
 
 

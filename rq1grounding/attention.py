@@ -87,12 +87,13 @@ class AttentionRecorder(_TextAttentionPatch):
     """Attention of query *groups* onto `keys`, averaged over each group's query rows.
 
     groups: name -> sequence positions of the query tokens (e.g. {"object:0": [...], "last": [L-1]}).
-    After the forward: maps[name] -> [layers, heads, n_keys] (float16, CPU) and
+    After the forward: maps[name] -> [layers, heads, n_keys] (`dtype`, default float16, CPU) and
     mass[name] -> [layers, heads], the total attention the group puts on `keys`.
     """
 
-    def __init__(self, model, groups: dict, keys):
+    def __init__(self, model, groups: dict, keys, dtype=torch.float16):
         super().__init__(model)
+        self.dtype = dtype
         self.groups = {g: list(map(int, p)) for g, p in groups.items() if len(p)}
         self.all_q = sorted({p for v in self.groups.values() for p in v})
         self.col = {p: i for i, p in enumerate(self.all_q)}
@@ -106,7 +107,7 @@ class AttentionRecorder(_TextAttentionPatch):
         qpos = torch.tensor(self.all_q, device=q.device)
         p = self._rows(q, k, qpos, scaling)[:, :, self.keys.to(q.device)]  # [H, Q, n_keys]
         for g, ps in self.groups.items():
-            self._maps.setdefault(g, []).append(p[:, [self.col[x] for x in ps]].mean(1).half().cpu())
+            self._maps.setdefault(g, []).append(p[:, [self.col[x] for x in ps]].mean(1).to(self.dtype).cpu())
         return out
 
     def __enter__(self):

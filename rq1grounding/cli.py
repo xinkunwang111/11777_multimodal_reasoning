@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 
@@ -72,6 +73,14 @@ def write_jsonl(path, rows):
     with open(path, "w") as f:
         for r in rows:
             f.write(json.dumps(to_jsonable(r)) + "\n")
+
+
+def write_csv(path, rows):
+    if rows:
+        with open(path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(dict.fromkeys(k for r in rows for k in r)))
+            w.writeheader()
+            w.writerows(to_jsonable(rows))
 
 
 def read_jsonl(path):

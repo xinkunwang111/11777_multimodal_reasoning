@@ -4,7 +4,8 @@
 
 - **探查 1**：注意力能找到物体吗？答错时也能吗？
 - **探查 2**：这份注意力有没有被答案用到？用在哪几层？
-- **方法**：在这些层里，把注意力往"注意力自己找到的区域"上再集中一些。免训练，每题两次前向。
+- **方法 A**：在这些层里，把注意力往"注意力自己找到的区域"上再集中一些。免训练，每题两次前向。
+- **方法 B（复现 VEA）**：复现 ICLR 2026 的 *Seeing but Not Believing*（VEA）。一次前向读出模型在看图像的哪里，把其余部分调暗，再让模型在这张图上回答。免训练，超参数用论文默认值。
 
 **交给 agent 执行时，直接用 [AGENT_GUIDE.txt](AGENT_GUIDE.txt)：从 clone 开始的一步步运行指南，每步都带检查和失败处理。**
 每个实验的设计细节见 [docs/DESIGN.md](docs/DESIGN.md)。本文档只讲怎么跑。
@@ -112,7 +113,8 @@ bash run_all.sh              # 全量；结果汇总在 outputs/Qwen3-VL-8B-Inst
 | `data` | 生成合成集；V\* 不存在时自动下载 | `scripts/make_synthetic.py` | — |
 | `p1` | 探查 1：注意力能找到物体吗，答错时也能吗？ | `scripts/probe1_attention.py` | — |
 | `p2` | 探查 2：切断物体上的注意力，答案变差吗？在哪几层？ | `scripts/probe2_knockout.py` | — |
-| `method` | 方法：在读取层放大注意力找到的区域，与 crop 和 GT 区域对比 | `scripts/method_steer.py` | p1、p2 |
+| `method` | 方法 A：在读取层放大注意力找到的区域，与 crop 和 GT 区域对比 | `scripts/method_steer.py` | p1、p2 |
+| `vea` | 方法 B：复现 VEA（调暗注意力之外的区域再回答），含论文的消融和两项分析 | `scripts/method_vea.py` | —（自己在校准集上选层） |
 | `appendix` | 附录（默认不跑）：DeepStack / MRoPE 消融、logit lens、线性探针 | `scripts/appendix/*.py` | p1 |
 | `report` | 汇总成 `REPORT.md` | `scripts/collect_results.py` | — |
 
@@ -158,15 +160,18 @@ CUDA_VISIBLE_DEVICES=1 STEPS="appendix" bash run_all.sh &
 M=checkpoints/Qwen3-VL-8B-Instruct
 D="--dataset vstar --data_root data/vstar"   # 换成合成集：--dataset synthetic --data_root data/synthetic
 
-# 探查 1（会写出 config.json：grounding heads + 区域阈值，供方法使用）
+# 探查 1（会写出 config.json：grounding heads + 区域阈值，供方法 A 使用）
 python scripts/probe1_attention.py --model $M $D --out outputs/run1/vstar/p1_attention
 
-# 探查 2（会写出逐题的切断结果，方法从中选出读取层）
+# 探查 2（会写出逐题的切断结果，方法 A 从中选出读取层）
 python scripts/probe2_knockout.py --model $M $D --out outputs/run1/vstar/p2_knockout
 
-# 方法（需要探查 1、2 的输出）
+# 方法 A（需要探查 1、2 的输出）
 python scripts/method_steer.py --model $M $D --p1 outputs/run1/vstar/p1_attention \
     --p2 outputs/run1/vstar/p2_knockout --out outputs/run1/vstar/method
+
+# 方法 B：VEA 复现（不依赖探查 1、2）
+python scripts/method_vea.py --model $M $D --out outputs/run1/vstar/vea
 
 # 附录（可选）
 python scripts/appendix/qwen3vl_design.py --model $M $D --p1 outputs/run1/vstar/p1_attention --out outputs/run1/vstar/appendix_design
@@ -198,6 +203,7 @@ python scripts/collect_results.py outputs/run1
 | `probe1_attention.py` | `--calib_frac 0.3`（或 `--calib_dataset synthetic --calib_root data/synthetic`）、`--top_heads 8`、`--sink_k 5`、`--n_vis 12` |
 | `probe2_knockout.py` | `--window 4 --stride 4`（层窗口）、`--groups all`（也可以加 `last object`）、`--mode scale`（`shift` = 保持图像总注意力不变的切断） |
 | `method_steer.py` | `--lambdas 0.25 0.5 0.75`（放大强度候选）、`--steer_mode shift`、`--modes steer crop`（还可加 `text draw`）、`--sources attn gt`、`--crop_pixels`、`--pad` |
+| `method_vea.py` | 论文默认值：`--top_frac 0.1`（选层比例）、`--alpha 0.5`（无证据处的亮度）、`--sigma 0.5`（高斯平滑，× 图像短边）、`--lam 10`（去噪阈值）；`--layers`（跳过选层，直接指定层）、`--variants`（只跑部分对照组） |
 
 ## 7. 结果在哪里，先看什么
 
@@ -209,10 +215,11 @@ outputs/Qwen3-VL-8B-Instruct/
     p1_attention/  summary.json  config.json  layers.png  heads.png  vis/*.png  per_sample.jsonl
     p2_knockout/   summary.json  knockout_all.png  per_sample.jsonl
     method/        summary.csv  by_found.csv  region_quality.csv  summary_by_category.csv  calibration.json
+    vea/           summary.csv  attribution.csv  by_found.csv  profile.json  layers_rapt.png  layers_auroc.png  vis/*.png
     appendix_*/    （如果跑了附录）
 ```
 
-按研究逻辑，依次回答三个问题：
+按研究逻辑，依次回答以下问题：
 
 | 问题 | 看哪里 | 看什么 |
 |---|---|---|
@@ -220,6 +227,8 @@ outputs/Qwen3-VL-8B-Instruct/
 | 这份注意力被用到了吗？ | `p2_knockout/summary.json` → `groups.all.used` | `delta_target` 是否明显比 `delta_control` 更负；`share_target_hurts_more` 是切物体比切对照伤得更多的题目比例；`window` 是读取层 |
 | 放大有用吗？ | `method/summary.csv` | `steer` 行的 `attn` 列与 `base`、`base_hi`、`crop` 比较；`gt` 列是区域完全正确时的上界 |
 | 收益来自哪里？ | `method/by_found.csv` | 收益应主要出现在"注意力找到了物体"的那组题上 |
+| VEA 在 Qwen3-VL / V\* 上有用吗？ | `vea/summary.csv` | `vea` 行与 `base`、`inst`（只加提示语、不改图）比较；`vea_gt` 是用 GT 框高亮的上界；`fixed` / `broken` 是改对 / 改错的题数；其余行是论文的消融 |
+| 用 VEA 的口径，答错时注意力也指对了吗？ | `vea/summary.json` → `seeing_not_believing` | 答对 / 答错两组的 evidence AUROC 和峰值命中率；`layers_rapt.png` 是论文中"证据 vs 非证据"的逐层曲线 |
 
 ## 8. 计算量（前向次数）
 
@@ -229,7 +238,8 @@ outputs/Qwen3-VL-8B-Instruct/
 |---|---|---|
 | 探查 1 | 1 | 191 |
 | 探查 2 | 1 + 9 个层窗口 × 3 个区域 = 28 | 约 5.3k |
-| 方法 | 校准题 1 + 12，测试题 6 | 约 1.5k（30% 校准） |
+| 方法 A | 校准题 1 + 12，测试题 6 | 约 1.5k（30% 校准） |
+| 方法 B（VEA） | 校准题 1，测试题 8 | 约 1.1k |
 | 附录 DeepStack / MRoPE | 8 | 约 1.5k |
 
 合成集默认约 900 题，耗时主要在探查 2。可以用 `SYNTH_N=100` 或 `LIMIT=...` 缩小。所有前向都不保留 KV cache，每次只处理一道题。
