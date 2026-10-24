@@ -57,6 +57,12 @@ def mock(tmp_path_factory):
     return root
 
 
+def load_vstar_mock(mock):
+    from rq1grounding.data import load_vstar
+
+    return [s for s in load_vstar(str(mock / "vstar")) if s.has_gt]
+
+
 def run(script, *args):
     r = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", script), *map(str, args)],
                        capture_output=True, text=True, cwd=ROOT)
@@ -77,6 +83,14 @@ def test_vstar_pipeline(mock):
     run("method_steer.py", *common, "--p1", D / "p1_attention", "--p2", D / "p2_knockout", "--calib_frac", 0.4,
         "--lambdas", 0.5, "--crop_pixels", 32768, "--out", D / "method")
     run("method_vea.py", *common, "--calib_frac", 0.4, "--n_vis", 1, "--out", D / "vea")
+    run("attention_vs_accuracy.py", *common, "--n_vis", 2, "--out", mock / "attention_vs_accuracy")
+    a = json.load(open(mock / "attention_vs_accuracy" / "summary.json"))
+    assert a["n_scored"] == len(load_vstar_mock(mock)) and {"all", "direct_attributes", "relative_position"} <= set(a["by_category"])
+    t = a["by_category"]["all"]["table"]
+    assert sum(t["looks_right"].values()) + sum(t["looks_elsewhere"].values()) == a["n_scored"]
+    assert len(os.listdir(mock / "attention_vs_accuracy" / "vis")) == 2
+    for f in ("gallery.png", "accuracy_vs_attention.png", "layers.png"):
+        assert (mock / "attention_vs_accuracy" / f).exists(), f
     run("appendix/qwen3vl_design.py", *common, "--p1", D / "p1_attention", "--conditions", "baseline", "pos_hflip",
         "--out", D / "appendix_design")
     rows = [json.loads(line) for line in open(D / "p1_attention" / "per_sample.jsonl")]
