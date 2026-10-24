@@ -145,7 +145,15 @@ RQ1 实验运行指南（交给执行 agent 使用）
 
 第 8 步：全量运行（后台执行）
 ----------------------------------------------------------------
-  根据第 7 步估算的总耗时选择命令：
+  【核心实验，最优先】注意力看得准不准，与答对率是否直接相关（全部 191 道 V* 题，每题 1 次前向，
+  不需要第 7 步的试跑；V100 用 float16，A100 / H100 用 bfloat16）：
+     nohup python scripts/attention_vs_accuracy.py --model checkpoints/Qwen3-VL-8B-Instruct \
+         --data_root data/vstar --dtype float16 --out outputs/attention_vs_accuracy > attention_run.log 2>&1 &
+  【检查】attention_run.log 末尾打印了 all / direct_attributes / relative_position 三行结果，
+         outputs/attention_vs_accuracy/ 下有 accuracy_vs_attention.png、gallery.png、layers.png、vis/。
+         "scored N / 191" 中的 N 应接近 191；"non-finite logits" 应为 0（不为 0 说明 float16 溢出，改用 bfloat16）。
+
+  以下是其余实验（可选），根据第 7 步估算的总耗时选择命令：
 
   A. 时间充足（默认，跑 V* 和完整合成集）：
      nohup env MODEL=checkpoints/Qwen3-VL-8B-Instruct bash run_all.sh > full_run.log 2>&1 &
@@ -181,7 +189,10 @@ RQ1 实验运行指南（交给执行 agent 使用）
 
   然后按以下格式回报。所有数字从 outputs/Qwen3-VL-8B-Instruct/REPORT.md 的 "## vstar" 部分摘录：
 
-  1. 环境：GPU 型号、显存、使用的模型、MAX_PIXELS 是否改过、选的是第 8 步的 A / B / C 哪个方案。
+  0. 核心实验：attention_run.log 末尾的三行结果，以及 "scored N / 191 (non-finite logits: ...)" 那一行；
+     附上 outputs/attention_vs_accuracy/ 下的 accuracy_vs_attention.png 和 gallery.png。
+     打包：tar czf attention_results.tar.gz outputs/attention_vs_accuracy attention_run.log
+  1. 环境：GPU 型号、显存、使用的模型、dtype、MAX_PIXELS 是否改过、选的是第 8 步的哪个方案。
   2. 第 6 步自检的完整输出。
   3. 探查 1：报告中这一行
        "attention on the object when the answer is correct: X; when it is wrong: Y"
