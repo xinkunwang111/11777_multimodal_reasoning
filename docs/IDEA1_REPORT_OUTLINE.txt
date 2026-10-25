@@ -1,0 +1,262 @@
+================================================================================
+ Midterm Report — Research Idea 1 写作纲要
+ 题目（暂定）：Does the Model Look Where It Answers?
+              Attention Grounding vs. Answer Correctness in Qwen3-VL on V*
+================================================================================
+
+本文件只覆盖 idea 1 的部分：
+  (a) 我需要写进公共章节（Abstract / Intro / Related Work / Problem Statement / Methodology）的内容；
+  (b) Section "Research Idea 1" 的三个小节（Initial Implementation / Results and Discussion / Updated Research Idea）。
+所有数字用 [ ] 占位，跑完 scripts/attention_vs_accuracy.py 之后从 summary.json 填入。
+图片文件都在 outputs/attention_vs_accuracy/ 下。
+
+篇幅（按评分说明）：Initial Implementation 约 1 页，Results 约 0.75–1 页，Updated Idea 约 0.5 页，
+合计约 2.5 页。双栏模板一页大约放 2 张单栏图，或 1 张通栏图加一段文字。
+
+--------------------------------------------------------------------------------
+0. 一句话主张（全文都围绕它）
+--------------------------------------------------------------------------------
+"模型的注意力看没看准物体，与它能不能答对直接相关"：
+  - 看准时准确率 [xx]%，没看准时 [yy]%；Fisher p = [ ]，按类别拆开后依然成立 / 不成立；
+  - 答错的题分成两类，修法不同：
+      * "没看到"（注意力不在物体上）：定位失败；
+      * "看到了但没答对"（注意力在物体上）：读取 / 绑定失败。
+这个分解决定了 Updated Research Idea 往哪个方向走（见第 7 节）。
+
+结果可能是正向的，也可能不显著。两种情况的写法都在第 6.4 节给出，不要等结果出来再改结构。
+
+--------------------------------------------------------------------------------
+1. 写进公共章节的内容
+--------------------------------------------------------------------------------
+[Abstract] 给 idea 1 一到两句：
+  "We probe whether Qwen3-VL-8B attends to the queried object in high-resolution images
+   (V*), and find that answer accuracy is [xx]% when the attention peak lies on the object
+   versus [yy]% otherwise (p=[ ]). Errors split into localisation failures ([n1]) and
+   'seeing but not answering' failures ([n2])."
+
+[Introduction] 一段动机 + 一句贡献：
+  - 动机：VLM 在高分辨率图像的小物体问题上表现差（V* 的物体平均只占图像的很小一部分）。
+    一个基本问题是：错误来自"没看到"，还是"看到了但没用好"？这两种失败对应完全不同的改进方向
+    （提高分辨率 / 视觉搜索 vs. 改进跨模态融合）。
+  - 贡献句（"In this paper, ..."）：用模型自身的注意力作为探针，
+    在全量 V*（191 题）上量化"注意力是否落在 GT 物体上"与答对率的关系，并按这个关系分解错误。
+  - Figure 1（概览图）的候选：从 gallery.png 里取两行，左边"答对且看准"，右边"答错且看偏"。
+    每行保留"原图 + GT 框"和"融合图"两列即可，一眼能看出"看哪里"和"答对没有"的关系。
+
+[Related Work] idea 1 对应的一组（约 5–7 篇，写成一段）：
+  (i)  高分辨率与视觉搜索：V* / SEAL (Wu & Xie, CVPR 2024)；
+       ViCrop "MLLMs Know Where to Look" (Zhang et al., ICLR 2025)：同样发现 MLLM 知道看哪里，
+       但用于 crop，没有和答对率做系统的条件分析。
+  (ii) 注意力与答对的脱节：Seeing but Not Believing / VEA (Liu et al., ICLR 2026) —— 最接近我们的工作。
+       区别：他们用最后一个 token 的注意力，在 Qwen2.5-VL 和 TextVQA 等数据上；
+       我们用问题中物体名 token 的注意力（逐个物体对照各自的 GT 框，关系题要求两个物体都命中），
+       在 Qwen3-VL（带 DeepStack）和 V* 小物体上，并按类别控制混杂因素。
+  (iii) 注意力作为解释的局限与 attention sink：
+       Jain & Wallace (NAACL 2019)、Wiegreffe & Pinter (EMNLP 2019)；
+       Xiao et al. (ICLR 2024, attention sinks)、Darcet et al. (ICLR 2024, registers)、
+       Kang et al. (ICLR 2025, visual attention sink)：说明为什么要去掉 sink token。
+  (iv) 跨模态信息流的可解释性：Zhang et al. (CVPR 2025, cross-modal information flow)；
+       Neo et al. (ICLR 2025)。
+  模型：Qwen3-VL technical report (2025)；DeepStack (Meng et al., NeurIPS 2024)。
+  (所有引用请在 Google Scholar 核对年份和会议后再写进 references.bib。)
+
+[Problem Statement] 给 idea 1 的符号（与全文统一）：
+  - 样本 (I, q, O, y)：图像 I，问题 q，问题中提到的物体 O = {o_1..o_m}（属性题 m=1，关系题 m=2），
+    每个物体有 GT 框 B_k，答案 y ∈ {选项}。
+  - 模型 p_θ(· | I, q)，预测 ŷ = argmax_c p_θ(c | I, q)（只在选项字母上取 argmax），
+    答对指示 c = 1[ŷ = y]。
+  - 视觉 token 网格 H×W，第 j 个 token 对应一个 32×32 px 的格子；
+    GT 掩码 G_k(j) = 1[格子 j 与 B_k 有重叠]。
+  - 研究问题：令 g ∈ {0,1} 为"注意力是否落在物体上"（定义见第 2 节），检验
+        P(c = 1 | g = 1) > P(c = 1 | g = 0)，
+    并且这个关系在同一类别内部仍然成立。
+
+[Experimental Methodology] idea 1 的部分：
+  - 数据：V* Bench，191 道多选题，两类：
+      * direct_attributes：115 题，4 个选项，随机准确率 25%；
+      * relative_position：76 题，2 个选项，随机准确率 50%。
+    图像分辨率高（约 2246×1582），每题都带目标物体的 GT 框。
+    （数字请对照数据文件核对。）
+  - 不训练，不需要 train/val 划分：191 题全部作为测试集。唯一由数据决定的选择是"用哪些层"，
+    它只用 GT 框、不看答案，因此不会人为制造注意力与答对之间的关联（第 2 节详细说明）。
+  - 指标：准确率（选项字母 logits）、pointing（命中率）、AUROC。统计方法：
+      * Wilson 95% 置信区间；
+      * Fisher 精确检验；
+      * odds ratio（加 0.5 的 Haldane 校正）；
+      * Mann-Whitney U 检验。
+  - 实现：Qwen3-VL-8B-Instruct，每张图 1024 个视觉 token（max_pixels = 1,048,576），
+    V100 上 fp16；被记录的注意力行用 fp32 重算。
+
+--------------------------------------------------------------------------------
+2. Section: Research Idea 1 — Initial Implementation（约 1 页）
+--------------------------------------------------------------------------------
+2.1 研究想法的引入（1 段）
+  - 假设：如果 VLM 的跨模态对齐（alignment）在起作用，那么问到"手套是什么颜色"时，
+    "glove" 这个词对图像的注意力应该落在手套上；并且看准的时候应该更容易答对。
+  - 这是课程里 alignment / grounding 的直接检验：文本实体 ↔ 图像区域。
+
+2.2 Baseline 模型
+  - Qwen3-VL-8B-Instruct（2025 年的开源 SOTA VLM），零样本作答。
+    选它的理由：结构较新（DeepStack 把视觉特征注入 LLM 第 0–2 层）；视觉 token 网格精确已知，
+    可以和 GT 框逐格对齐。
+  - 输出：每题一个答案，加上一次前向中记录的注意力。不生成文本，不调用工具。
+
+2.3 注意力探针（写成公式）
+  - 物体 o 的名字在问题中对应 token 集合 T_o。在第 l 层、第 h 个 head，记录 query t ∈ T_o
+    对视觉 token j 的注意力 a^{l,h}_{t,j}。
+  - 对所有 head 和所有名字 token 取平均：
+        A^l_o(j) = (1/(|H|·|T_o|)) Σ_h Σ_{t∈T_o} a^{l,h}_{t,j}
+  - 去掉 attention sink：把残差范数最大的 k=5 个视觉 token（无论问什么都吸走注意力）置零，
+    再归一化：Ã^l_o(j) ∝ A^l_o(j)·1[j ∉ S]。
+  - 层的选择：L* = 按 AUROC 排名前 25% 的层（36 层中取 9 层）。每层的 AUROC 是该层在全部 191 题、
+    全部物体上 AUROC 的平均，只用 G_k、不用答案。
+    最终的图是 Ā_o = normalize( mean_{l∈L*} Ã^l_o )。
+    【关键论证，必须写】选层只看"注意力与 GT 框的对应"，从不看 c，
+    所以它无法人为地让"看准"和"答对"产生关联；而且因为没有在答案上调任何参数，
+    也不需要划分校准集，全部 191 题都可以用于统计。
+  - 两个度量：
+      * pointing：π_k = 1[argmax_j Ā_{o_k}(j) ∈ G_k]。不需要阈值。
+      * AUROC_k：Ā 把框内格子排在框外格子前面的概率（0.5 = 随机，1 = 完美）。
+  - 题目级别：
+      * g = Π_k π_k（关系题要求两个物体都命中）；
+      * AUROC = mean_k AUROC_k。
+
+2.4 统计检验
+  - 2×2 表：g × c。报告 P(c|g=1)、P(c|g=0)（都带 Wilson CI）、Fisher p 和 OR。
+  - 剂量-反应：按 AUROC 三等分后的准确率。
+  - 比较答对 / 答错两组的 AUROC 中位数（Mann-Whitney U）。
+  - 全部按类别拆开报告。原因：两类题的随机准确率不同（属性题 25%，关系题 50%），
+    "看准"的难度也不同（关系题要命中两个物体）。混在一起时，类别本身就可能制造出
+    "看准 ↔ 答对"的关联（辛普森悖论），拆开后才能排除。
+
+  [可选，0.5 栏的示意图] 方法流程：问题 → 物体名 token → 逐层注意力 → 去 sink → 选层 → 注意力图
+  → 峰值是否在 GT 框里。需要手画（draw.io / PowerPoint），篇幅紧张时可以省略，用 2.3 的公式代替。
+
+--------------------------------------------------------------------------------
+3. Section: Research Idea 1 — Results and Discussion（约 0.75–1 页）
+--------------------------------------------------------------------------------
+3.1 Table 1（主表，必须有；评分要求"测试集上的指标表"）
+  行：All / direct_attributes / relative_position
+  列：n | Acc | 看准比例 P(g=1) | Acc | g=1 | Acc | g=0 | OR | Fisher p | AUROC 中位数（答对 / 答错）| MW p
+  来源：summary.json → by_category.{all, direct_attributes, relative_position}
+
+  LaTeX 骨架：
+    \begin{table}[t]\centering\small
+    \caption{Attention grounding vs. accuracy on V* (Qwen3-VL-8B). Acc$|g$: accuracy when the
+      attention peak is on (g=1) / off (g=0) the GT object; 95\% Wilson CIs in the text.}
+    \begin{tabular}{lrrrrrr}\toprule
+    Category & $n$ & Acc & $P(g{=}1)$ & Acc$|g{=}1$ & Acc$|g{=}0$ & Fisher $p$\\\midrule
+    All & 191 & [ ] & [ ] & [ ] & [ ] & [ ]\\
+    Attribute & 115 & ...\\
+    Relation & 76 & ...\\\bottomrule
+    \end{tabular}\end{table}
+  （列太多的话，把 AUROC 和 MW p 放到正文里写一句。）
+
+3.2 Figure 2：accuracy_vs_attention.png（主图，单栏）
+  - 左：看准 / 没看准两组的准确率，按类别分组，带误差棒。
+  - 右：按 AUROC 三等分的准确率曲线；单调上升就是"剂量-反应"证据。
+  - 正文写法："Accuracy rises from [a]% to [b]% as the attention concentrates on the object
+    (Fig. 2 right), and the gap persists within each category (Fig. 2 left)."
+
+3.3 Figure 3：layers.png（单栏）
+  - 逐层的 pointing 率，答对 / 答错两条曲线；阴影是选中的层 L*。
+  - 要讨论的点：
+      (1) 定位出现在哪些深度（浅层在 DeepStack 注入之后？中层？）；
+      (2) 两条曲线在哪些层分开得最大，说明那些层的定位与答对最相关；
+      (3) 深层是否所有题都看不准（注意力扩散 / 被文本主导）。
+  - 篇幅不够时可以挪到附录，正文保留一句结论（附录不计分，所以优先保留 Fig. 2 和 Fig. 4）。
+
+3.4 Figure 4：gallery.png（通栏，figure*，这是错误分析的核心）
+  - 四类情况，每类 1–2 例，每例四列：原图 + GT 框 | 注意力图 | 融合图 | 物体附近放大；
+    "+" 是注意力峰值。
+  - 如果整张 gallery 太高：每类只留 1 行（4 行 × 4 列）；或者从 vis/ 里挑更有代表性的题，
+    用 subfigure 拼起来。vis/ 里的文件名前缀就是所属类别
+    （correct_on_object__*、wrong_elsewhere__*、wrong_on_object__*、correct_elsewhere__*）。
+  - 挑图标准：物体清晰可见、问题有代表性；每类尽量选不同场景，避免重复。
+
+3.5 失败案例分析（正文主体，按 2×2 的四个格子组织；评分最看重这一部分）
+  (A) 答错 + 看偏（定位失败）[n = ]
+      可能原因，逐条用例子支撑：
+        - 物体比一个视觉 token 还小（1024 个 token 时一个 token 约等于原图 70–100 px），
+          被缩放抹掉了；
+        - 注意力被同类的显著物体或同名的其他实例吸走；
+        - 物体名有歧义 / 被分成多个 subword。
+      对应的修法：提高分辨率、视觉搜索、crop（见第 7 节）。
+      [可选的量化，几行代码]：从 per_sample.jsonl 读出 GT 框面积（以 token 数计），
+      画"看准比例 vs 物体大小"。如果小物体明显更难看准，这条分析就从定性变成定量。
+  (B) 答错 + 看准（"seeing but not answering"，读取 / 绑定失败）[n = ]
+      - 注意力找到了物体，答案却错了：信息在对齐这一步拿到了，在融合 / 推理这一步丢了。
+      - 属性题：颜色和材质相近的选项混淆；邻近物体的颜色串进来（attribute binding 错误）。
+      - 关系题：两个物体都命中了，方位判断却错 —— 这是空间推理失败，而不是定位失败。
+      - 与 VEA (ICLR 2026) 的结论对照：他们在其他模型和数据上看到的同一现象，在 Qwen3-VL 和 V* 上是否也存在。
+  (C) 答对 + 看偏 [n = ]
+      - 关系题的随机准确率是 50%，属性题 25%：一部分是猜对的；
+      - 也可能是靠上下文或先验答对，或注意力在另一个实例上；
+      - 这一格的比例本身就说明"答对 ≠ 看到了"。
+  (D) 答对 + 看准 [n = ]：理想情况，给 1 例作为参照即可。
+
+3.6 局限（2–3 句，必须写）
+  - 相关不等于因果：注意力看准与答对同时出现，不能证明答案用了这份注意力。
+    因果检验（把物体区域的注意力切断）放到 final（探查 2 的代码已有）。
+  - 注意力只是信息流的一部分（Jain & Wallace 2019）；所有 head 取平均会稀释少数 grounding heads。
+  - 只测了一个模型、一个分辨率预算；n = 191，关系题只有 76 题，置信区间较宽。
+
+--------------------------------------------------------------------------------
+4. Section: Research Idea 1 — Updated Research Idea（约 0.5 页）
+--------------------------------------------------------------------------------
+根据 3.5 中 (A) 和 (B) 哪一类占多数，选择主方向（两个都写，但以多的那个为主）：
+
+  若 (B)"看准了但答错"多 → 问题在融合 / 读取：用模型自己的注意力反过来增强证据
+    方向 1：注意力引导（读取层注意力重分配，代码已实现：method_steer.py）
+      在读取层 l ∈ L_read，把图像上"其他区域"注意力的 λ 比例移到注意力自己找到的区域 R 上：
+        a'_{t,j} = a_{t,j}(1−λ)                                 若 j ∉ R
+        a'_{t,j} = a_{t,j} + λ·Σ_{j'∉R} a_{t,j'} · a_{t,j}/Σ_{j''∈R} a_{t,j''}  若 j ∈ R
+      其中 R = {j : Ā(j) ≥ τ·max Ā} 中包含峰值的连通块。文本注意力和图像总注意力保持不变。
+      对照：VEA (ICLR 2026) 改输入像素（把证据之外的区域调暗），代码也已实现（method_vea.py）。
+  若 (A)"没看到"多 → 问题在定位 / 分辨率：注意力引导的多步视觉搜索
+    方向 2：用注意力决定"看哪里、要不要再看"
+      Ā 足够集中（例如峰值占比或熵低于阈值）时，在 R 上裁一块高分辨率图，与原图一起作答：
+        ŷ = argmax_c p_θ(c | I, crop(I, R), q)；
+      Ā 不集中时，按注意力把图像分块，逐块搜索（类似 V* / ZoomEye，但不训练）。
+  两个方向都需要 final 中的因果检验（knockout）来证明注意力确实被用于作答。
+
+这一节和 midterm 结果的联系一定要写清楚（评分要求 "how the results of the midterm changed the research ideas"）：
+  "The 2×2 decomposition shows that [most] errors occur when the model *does* attend to the
+   object, so we shift from improving localisation to improving how attended evidence is used."
+  （或者反过来写。）
+
+--------------------------------------------------------------------------------
+5. 图表清单（按在正文中出现的顺序）
+--------------------------------------------------------------------------------
+  编号      文件                                       位置          必须 / 可选
+  Fig. 1    gallery.png 中的 2 行（或 vis/ 中的 2 张）   Intro，单栏   建议
+  Fig. 2    accuracy_vs_attention.png                 3.2，单栏     必须
+  Fig. 3    layers.png                                3.3，单栏     建议（篇幅紧张时挪到附录）
+  Fig. 4    gallery.png（或从 vis/ 挑图拼成）           3.4，通栏     必须
+  Table 1   summary.json → by_category                3.1           必须
+  (可选)    方法流程示意图（手画）                       2.3           可选
+  (可选)    看准比例 vs 物体大小（需另写几行代码）         3.5 (A)       可选
+
+  插图写法：\includegraphics[width=\columnwidth]{figs/accuracy_vs_attention.png}；
+  通栏用 \begin{figure*} ... \includegraphics[width=\textwidth]{figs/gallery.png}。
+  把 outputs/attention_vs_accuracy/*.png 复制到 Overleaf 项目的 figs/ 目录下。
+
+--------------------------------------------------------------------------------
+6. 跑完实验后的填数步骤
+--------------------------------------------------------------------------------
+  6.1 确认日志里：
+        - "scored N / 191" 中的 N 接近 191；
+        - non-finite logits = 0（否则改用 bfloat16 重跑）。
+  6.2 从 summary.json 填数：
+        - Table 1 ← by_category；
+        - 三等分曲线 ← accuracy_by_auroc_tercile；
+        - 选中的层 ← layers。
+  6.3 数清 2×2 四个格子的题数（table 字段），填进 3.5 的 [n = ]。
+  6.4 结论的两种写法：
+      - 显著（Fisher p < 0.05，且至少在属性题内部也成立）：
+        "Grounding is predictive of correctness"，然后重点讨论 (B) 类为何仍然答错。
+      - 不显著或只在全体上显著：如实写 "attention location is only weakly related to
+        correctness"。这本身就是一个发现：说明错误主要不在定位，
+        与 VEA 的 "seeing but not believing" 一致，直接导向方向 1。
+        不要只报告显著的那一类。
+  6.5 AI 使用声明（附录，必须写）：代码由 AI 辅助编写，实验设计和分析由团队完成（按实际情况描述）。
